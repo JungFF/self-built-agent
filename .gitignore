@@ -1,0 +1,21 @@
+# 用户铁律：markdown 与 docs 不进 git
+*.md
+docs/
+
+# 密钥与敏感物
+secrets/
+*.key
+*.pub
+.env
+
+# 构建产物与三方包
+dist/
+build/
+*.zip
+third_party/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
