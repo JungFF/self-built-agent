@@ -1,0 +1,45 @@
+# factory/config.yaml.tmpl —— 出厂状态（Hermes v0.18.2 / commit 4281151a 实测键名）
+# 只写需要偏离默认值的键；其余保持 Hermes 默认。
+# 安装器会把 {{WORKSPACE_DIR}} 替换成最终用户桌面的「小助手」文件夹绝对路径。
+#
+# ── DashScope 路由查证结论（不是猜测，逐行核对钉死 commit 4281151a 的源码）──────
+# 问题：model.provider 的合法值枚举（cli-config.yaml.example:12-37）里没有列出
+# "dashscope"，但 Hermes 又原生支持 DASHSCOPE_API_KEY。DashScope 到底怎么路由？
+#
+# 结论：provider: "auto" + 环境变量里的 DASHSCOPE_API_KEY 就够了，不需要任何
+# "dashscope/<model>" 前缀路由。依据：
+#   1. hermes_cli/auth.py:320-327 —— PROVIDER_REGISTRY["alibaba"] 定义：
+#        inference_base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+#        api_key_env_vars=("DASHSCOPE_API_KEY",)
+#        base_url_env_var="DASHSCOPE_BASE_URL"
+#      即 DashScope 的规范 provider id 是 "alibaba"（不是 "dashscope"），
+#      "dashscope" 只是它的别名（见第 3 点）。
+#   2. hermes_cli/auth.py:1766-1784 —— resolve_provider() 在 requested="auto"
+#      时，会遍历 PROVIDER_REGISTRY 逐个检查 auth_type == "api_key" 的 provider
+#      的 api_key_env_vars 是否在环境变量里"看起来像真凭证"（has_usable_secret）。
+#      "alibaba" 条目会被这个循环命中——只要进程环境里有 DASHSCOPE_API_KEY 且没有
+#      OPENAI_API_KEY / OPENROUTER_API_KEY（这两个在更靠前的分支拦截，见
+#      auth.py:1736），就会自动解析成 provider="alibaba"，进而使用上面的
+#      inference_base_url（可被 DASHSCOPE_BASE_URL 环境变量覆盖）。
+#   3. plugins/model-providers/alibaba/__init__.py（GitHub 同 commit）——
+#      ProviderProfile(name="alibaba", aliases=("dashscope", "alibaba-cloud",
+#      "qwen-dashscope"), env_vars=("DASHSCOPE_API_KEY",), base_url=
+#      "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")。这解释了
+#      "dashscope" 这个别名是从哪来的——它能作为 model.provider 的显式值使用
+#      （经 auth.py:1685-1693 的别名合并逻辑解析回 "alibaba"），但不是规范值，
+#      所以没出现在 cli-config.yaml.example 的枚举注释里。
+#   4. cli-config.yaml.example:12-37 —— 官方示例文件里 provider 枚举注释确实
+#      没提 dashscope/alibaba（该列表本身有遗漏，不代表功能不支持）。
+#
+# 结论对应下面 provider: "auto" 的写法：不需要写 "alibaba" 或 "dashscope"，
+# 因为 .env 里只放了 DASHSCOPE_API_KEY，auto 检测会自然落到它。
+
+model:
+  default: "qwen3.7-plus"
+  provider: "auto"          # auto 会从凭证（DASHSCOPE_API_KEY）自动检测，见上方查证结论
+
+display:
+  language: "zh"            # 中文 UI。合法值 en/zh/ja/de/es/fr/tr/uk；未知值静默回退 en
+
+terminal:
+  cwd: "{{WORKSPACE_DIR}}"  # 工作台：桌面的「小助手」文件夹

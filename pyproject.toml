@@ -10,3 +10,11 @@ dependencies = [
 dev = [
     "pytest>=9.1.1",
 ]
+
+[tool.pytest.ini_options]
+# `uv run pytest` invokes the pytest console-script entry point, which does
+# NOT add the current working directory to sys.path (unlike `python -m
+# pytest`). Without this, top-level packages like `builder` and `tools`
+# are unimportable from tests. `pythonpath = ["."]` makes `uv run pytest`
+# behave the same as `uv run python -m pytest` for in-repo imports.
+pythonpath = ["."]
