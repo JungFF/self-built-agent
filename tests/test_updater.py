@@ -28,21 +28,39 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from builder.paths import FACTORY_STAMP, WORKSPACE_DIRNAME
 from tools import updater
 from tools.updater import apply_update, parse_version, verify_manifest
+
+
+def _ws(tmp_path: Path) -> Path:
+    """桌面上的「小助手」工作台目录。
+
+    测试**必须**显式传它：apply_update 会把它渲染进 config.yaml，还会在它不存在时
+    建出来。如果让 apply_update 自己去推导"真实桌面"，跑一次测试就会在开发机
+    （和 CI）的 ~/Desktop 下真的长出一个「小助手」文件夹。推导只发生在 main()。
+    """
+    return tmp_path / "desktop" / WORKSPACE_DIRNAME
 
 
 def _publish(ch_dir: Path, version: str, priv: Ed25519PrivateKey, payload: bytes = b"") -> None:
     """用同一把密钥在通道目录里发布一个版本：包 + 清单 + 签名。可以对同一个
     目录反复调用来追加发布新版本（模拟维护者连续发版，用于测试“连续更新两次，
     旧版本会不会被清理”）。payload 用来发布一个“体量真实”的大包（不压缩存储），
-    给内存峰值测试用。"""
+    给内存峰值测试用。
+
+    包里必须带一份形状完整的 factory/（出厂母版）——真实发行版就是这个形状，
+    而且更新器会在切版本之前校验它。"""
     pkg = ch_dir / f"dist-{version}.zip"
     with zipfile.ZipFile(pkg, "w") as z:
         z.writestr("marker.txt", version)
+        z.writestr("factory/config.yaml.tmpl", f'model:\n  default: "{version}"\nterminal:\n  cwd: "{{{{WORKSPACE_DIR}}}}"\n')
+        z.writestr("factory/SOUL.md", f"我是小助手 {version}")
+        z.writestr("factory/skills/creative/ascii-art/SKILL.md", f"出厂技能 {version}")
         if payload:
             z.writestr(zipfile.ZipInfo("blob.bin"), payload, compress_type=zipfile.ZIP_STORED)
     manifest = json.dumps({
@@ -129,7 +147,7 @@ def test_apply_update_installs_new_version(tmp_path: Path):
     # test_missing_current_txt_neither_prunes_the_fallback_nor_fakes_a_rollback_target。
     (root / "versions" / "0.1.0").mkdir(parents=True)
     (root / "current.txt").write_text("0.1.0", encoding="utf-8")
-    assert apply_update(root, ch.as_uri(), pub) == "0.1.1"
+    assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) == "0.1.1"
     assert (root / "versions/0.1.1/marker.txt").read_text() == "0.1.1"
     assert (root / "current.txt").read_text(encoding="utf-8") == "0.1.1"
     assert (root / "previous.txt").read_text(encoding="utf-8") == "0.1.0"
@@ -140,7 +158,7 @@ def test_apply_update_noop_when_up_to_date(tmp_path: Path):
     root = tmp_path / "root"
     root.mkdir()
     (root / "current.txt").write_text("0.1.1", encoding="utf-8")
-    assert apply_update(root, ch.as_uri(), pub) is None
+    assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) is None
 
 
 def test_bad_signature_rejected(tmp_path: Path):
@@ -150,7 +168,7 @@ def test_bad_signature_rejected(tmp_path: Path):
     root.mkdir()
     (root / "current.txt").write_text("0.1.0", encoding="utf-8")
     with pytest.raises(InvalidSignature):
-        apply_update(root, ch.as_uri(), wrong_pub)
+        apply_update(root, ch.as_uri(), wrong_pub, _ws(tmp_path))
     # 签名不对 = 通道可能被冒充：拒绝必须是原子的，不能已经落了一半文件。
     assert (root / "current.txt").read_text(encoding="utf-8") == "0.1.0"
     assert not (root / "previous.txt").exists()
@@ -165,7 +183,7 @@ def test_sha256_mismatch_rejected(tmp_path: Path):
     root.mkdir()
     (root / "current.txt").write_text("0.1.0", encoding="utf-8")
     with pytest.raises(ValueError, match="sha256"):
-        apply_update(root, ch.as_uri(), pub)
+        apply_update(root, ch.as_uri(), pub, _ws(tmp_path))
     assert (root / "current.txt").read_text(encoding="utf-8") == "0.1.0"
     assert not (root / "versions").exists()
 
@@ -178,7 +196,7 @@ def test_bad_version_is_not_reinstalled(tmp_path: Path):
     root.mkdir()
     (root / "current.txt").write_text("0.1.0", encoding="utf-8")
     (root / "bad_versions.txt").write_text("0.1.1\n", encoding="utf-8")
-    assert apply_update(root, ch.as_uri(), pub) is None
+    assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) is None
     assert not (root / "versions" / "0.1.1").exists()
     assert (root / "current.txt").read_text(encoding="utf-8") == "0.1.0"
 
@@ -191,7 +209,7 @@ def test_network_unreachable_returns_none_not_crash(tmp_path: Path):
     (root / "current.txt").write_text("0.1.0", encoding="utf-8")
     unreachable_url = (tmp_path / "does-not-exist").as_uri()
     fake_pub = Ed25519PrivateKey.generate().public_key().public_bytes_raw().hex()
-    assert apply_update(root, unreachable_url, fake_pub) is None
+    assert apply_update(root, unreachable_url, fake_pub, _ws(tmp_path)) is None
     assert (root / "current.txt").read_text(encoding="utf-8") == "0.1.0"
 
 
@@ -210,7 +228,7 @@ def test_signed_but_not_json_manifest_raises_instead_of_silently_ignored(tmp_pat
     root.mkdir()
     (root / "current.txt").write_text("0.1.0", encoding="utf-8")
     with pytest.raises(json.JSONDecodeError):
-        apply_update(root, ch.as_uri(), pub_hex)
+        apply_update(root, ch.as_uri(), pub_hex, _ws(tmp_path))
 
 
 def test_disk_does_not_grow_unbounded_across_multiple_updates(tmp_path: Path):
@@ -222,17 +240,17 @@ def test_disk_does_not_grow_unbounded_across_multiple_updates(tmp_path: Path):
     (root / "current.txt").write_text("0.0.9", encoding="utf-8")
 
     ch, pub, priv = _channel(tmp_path, "0.1.0")
-    assert apply_update(root, ch.as_uri(), pub) == "0.1.0"
+    assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) == "0.1.0"
     assert (root / "versions" / "0.1.0").is_dir()
 
     _publish(ch, "0.1.1", priv)
-    assert apply_update(root, ch.as_uri(), pub) == "0.1.1"
+    assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) == "0.1.1"
     # 刚更新到 0.1.1：previous 是 0.1.0，是回滚目标，不能删。
     assert (root / "versions" / "0.1.0").is_dir()
     assert (root / "versions" / "0.1.1").is_dir()
 
     _publish(ch, "0.1.2", priv)
-    assert apply_update(root, ch.as_uri(), pub) == "0.1.2"
+    assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) == "0.1.2"
     # 再更新一次：previous 变成 0.1.1，再往前的 0.1.0 不再是任何人的回滚
     # 目标，必须被清理掉，否则 2.87GB/版本会无限堆积。
     assert (root / "previous.txt").read_text(encoding="utf-8") == "0.1.1"
@@ -252,7 +270,7 @@ def test_crash_mid_extraction_leaves_current_untouched(tmp_path: Path):
 
     with patch("zipfile.ZipFile.extractall", side_effect=RuntimeError("simulated power loss")):
         with pytest.raises(RuntimeError):
-            apply_update(root, ch.as_uri(), pub)
+            apply_update(root, ch.as_uri(), pub, _ws(tmp_path))
 
     assert (root / "current.txt").read_text(encoding="utf-8") == "0.1.0"
     assert not (root / "versions" / "0.1.1").exists()
@@ -269,11 +287,11 @@ def test_recovers_cleanly_after_a_crashed_attempt(tmp_path: Path):
 
     with patch("zipfile.ZipFile.extractall", side_effect=RuntimeError("simulated power loss")):
         with pytest.raises(RuntimeError):
-            apply_update(root, ch.as_uri(), pub)
+            apply_update(root, ch.as_uri(), pub, _ws(tmp_path))
 
-    assert apply_update(root, ch.as_uri(), pub) == "0.1.1"
+    assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) == "0.1.1"
     versions_dir = root / "versions"
-    assert not list(versions_dir.glob(".staging-*"))
+    assert not list(versions_dir.glob(".s-*"))
     assert not (root / "download.tmp.zip").exists()
 
 
@@ -298,15 +316,15 @@ def test_second_instance_during_extraction_cannot_brick_current(tmp_path: Path):
         real_extractall(self, path)
         if not reentered:  # 只重入一次，避免无限递归
             reentered.append(True)
-            nested_result.append(apply_update(root, ch.as_uri(), pub))
+            nested_result.append(apply_update(root, ch.as_uri(), pub, _ws(tmp_path)))
 
     with patch.object(zipfile.ZipFile, "extractall", extract_then_let_a_second_instance_run):
-        apply_update(root, ch.as_uri(), pub)
+        apply_update(root, ch.as_uri(), pub, _ws(tmp_path))
 
     assert nested_result == [None]  # 第二个实例拿不到锁：安静让路，不是错误
     current = (root / "current.txt").read_text(encoding="utf-8").strip()
     assert (root / "versions" / current).is_dir()  # current.txt 绝不能指向一个不存在的目录
-    assert not list((root / "versions").glob(".staging-*"))
+    assert not list((root / "versions").glob(".s-*"))
 
 
 def test_mid_download_drop_returns_none_not_crash(tmp_path: Path):
@@ -320,7 +338,7 @@ def test_mid_download_drop_returns_none_not_crash(tmp_path: Path):
     (root / "current.txt").write_text("0.1.0", encoding="utf-8")
 
     with _serve(ch, truncate_zip=True) as url:
-        assert apply_update(root, url, pub) is None
+        assert apply_update(root, url, pub, _ws(tmp_path)) is None
 
     assert (root / "current.txt").read_text(encoding="utf-8") == "0.1.0"
     assert not (root / "versions" / "0.1.1").exists()
@@ -337,7 +355,7 @@ def test_trailing_slash_in_channel_url_is_normalized(tmp_path: Path):
     (root / "current.txt").write_text("0.1.0", encoding="utf-8")
 
     with _serve(ch) as url:
-        assert apply_update(root, url + "/", pub) == "0.1.1"
+        assert apply_update(root, url + "/", pub, _ws(tmp_path)) == "0.1.1"
 
 
 def test_download_does_not_buffer_the_whole_package_in_memory(tmp_path: Path):
@@ -352,7 +370,7 @@ def test_download_does_not_buffer_the_whole_package_in_memory(tmp_path: Path):
 
     tracemalloc.start()
     try:
-        assert apply_update(root, ch.as_uri(), pub) == "0.1.1"
+        assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) == "0.1.1"
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
@@ -377,7 +395,7 @@ def test_missing_current_txt_neither_prunes_the_fallback_nor_fakes_a_rollback_ta
     (root / "versions" / "0.1.0").mkdir(parents=True)
     (root / "versions" / "0.1.0" / "marker.txt").write_text("0.1.0", encoding="utf-8")
 
-    assert apply_update(root, ch.as_uri(), pub) == "0.1.1"
+    assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) == "0.1.1"
 
     assert (root / "current.txt").read_text(encoding="utf-8") == "0.1.1"
     assert (root / "versions" / "0.1.0").is_dir(), "磁盘上唯一一个能启动的旧版本被剪掉了"
@@ -399,9 +417,9 @@ def test_crash_between_the_two_writes_leaves_a_bootable_rollbackable_state(tmp_p
     root.mkdir()
 
     # 先跑出一个稳态：current=0.1.1、previous=0.1.0，两个版本目录都在磁盘上。
-    assert apply_update(root, ch.as_uri(), pub) == "0.1.0"
+    assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) == "0.1.0"
     _publish(ch, "0.1.1", priv)
-    assert apply_update(root, ch.as_uri(), pub) == "0.1.1"
+    assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) == "0.1.1"
     assert (root / "previous.txt").read_text(encoding="utf-8") == "0.1.0"
 
     _publish(ch, "0.1.2", priv)
@@ -415,7 +433,7 @@ def test_crash_between_the_two_writes_leaves_a_bootable_rollbackable_state(tmp_p
 
     with patch.object(updater, "_atomic_write", side_effect=flaky):
         with pytest.raises(RuntimeError):
-            apply_update(root, ch.as_uri(), pub)
+            apply_update(root, ch.as_uri(), pub, _ws(tmp_path))
 
     current = (root / "current.txt").read_text(encoding="utf-8").strip()
     previous = (root / "previous.txt").read_text(encoding="utf-8").strip()
@@ -445,7 +463,7 @@ def test_tampered_manifest_with_the_maintainers_own_signature_rejected(tmp_path:
     (root / "current.txt").write_text("0.1.0", encoding="utf-8")
 
     with pytest.raises(InvalidSignature):
-        apply_update(root, ch.as_uri(), pub)  # 注意：公钥是**对的**那把
+        apply_update(root, ch.as_uri(), pub, _ws(tmp_path))  # 注意：公钥是**对的**那把
     assert (root / "current.txt").read_text(encoding="utf-8") == "0.1.0"
     assert not (root / "versions").exists()
 
@@ -462,7 +480,7 @@ def test_not_enough_free_disk_returns_none_instead_of_crashing(tmp_path: Path):
 
     almost_full = types.SimpleNamespace(total=10**9, used=10**9 - 512, free=512)
     with patch("shutil.disk_usage", return_value=almost_full):
-        assert apply_update(root, ch.as_uri(), pub) is None
+        assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) is None
 
     assert (root / "current.txt").read_text(encoding="utf-8") == "0.1.0"
     assert not (root / "versions" / "0.1.1").exists()
@@ -479,7 +497,7 @@ def test_missing_install_root_returns_none_instead_of_crashing(tmp_path: Path):
     ch, pub, _ = _channel(tmp_path, "0.1.1")
     missing_root = tmp_path / "never-installed"
 
-    assert apply_update(missing_root, ch.as_uri(), pub) is None
+    assert apply_update(missing_root, ch.as_uri(), pub, _ws(tmp_path)) is None
     assert not missing_root.exists(), "不该凭空长出一棵谁都没打算要的目录树"
 
 
@@ -504,16 +522,54 @@ def test_last_resort_guard_never_deletes_the_dir_current_txt_points_at(tmp_path:
         real_extractall(self, path)
         if not reentered:                     # 第二个实例跑完整个更新，把 current.txt 切过去
             reentered.append(True)
-            apply_update(root, ch.as_uri(), pub)
+            apply_update(root, ch.as_uri(), pub, _ws(tmp_path))
 
     with patch.object(updater, "_try_lock", return_value=granted_to_everyone), \
          patch.object(updater, "_unlock", lambda fh: None), \
          patch.object(zipfile.ZipFile, "extractall", extract_then_let_a_second_instance_win):
-        with contextlib.suppress(FileNotFoundError):   # 输的那个实例发现自己的 staging 没了
-            apply_update(root, ch.as_uri(), pub)
+        # 输的那个实例发现自己的 staging 被对方的 _cleanup_stale_temp 删了。它具体炸在
+        # 哪一步不重要（现在是"校验出厂母版"这道闸门先撞见目录没了 → ValueError；以前是
+        # os.replace → FileNotFoundError）——这条测试要钉死的是**炸完之后**的那条断言：
+        # current.txt 绝不能指向一个已经被删掉的目录。
+        with contextlib.suppress(FileNotFoundError, ValueError):
+            apply_update(root, ch.as_uri(), pub, _ws(tmp_path))
 
     current = (root / "current.txt").read_text(encoding="utf-8").strip()
     assert (root / "versions" / current).is_dir(), "current.txt 指向了一个已被删除的目录"
+
+
+def test_last_resort_guard_never_rmtrees_the_version_current_txt_points_at(tmp_path: Path):
+    """同一道"最后的保险"，这次真的把它执行到：另一个实例已经把这个版本装好、current.txt
+    也切过去了。本实例接着走到"最终目录已存在"那个分支——它绝不能把那个目录当成"上次半途
+    而废的残留"rmtree 掉：那一瞬间 current.txt 就指向了虚空，机器开机即挂。
+
+    上一条测试（..._never_deletes_the_dir_current_txt_points_at）走不到这个分支：输的那个
+    实例的 staging 先被对方的清理删掉，它在更早的"校验出厂母版"闸门上就炸了。于是这道保险
+    其实**没有被任何测试钉住**——把它换成 `if False:`，全套测试依然全绿。这里让第二个实例
+    在闸门**之后**才插进来，把执行真正送进那个分支。"""
+    ch, pub, _ = _channel(tmp_path, "0.1.2")
+    root = tmp_path / "root"
+    (root / "versions" / "0.1.1").mkdir(parents=True)
+    (root / "current.txt").write_text("0.1.1", encoding="utf-8")
+
+    granted_to_everyone = object()  # 假锁：两个实例同时往下跑（模拟锁在某个文件系统上失灵）
+    reentered = []
+    real_gate = updater.assert_factory_complete
+
+    def gate_then_let_a_second_instance_finish(factory):
+        real_gate(factory)
+        if not reentered:  # 第二个实例跑完整个更新：装好 0.1.2 并把 current.txt 切过去
+            reentered.append(True)
+            apply_update(root, ch.as_uri(), pub, _ws(tmp_path))
+
+    with patch.object(updater, "_try_lock", return_value=granted_to_everyone), \
+         patch.object(updater, "_unlock", lambda fh: None), \
+         patch.object(updater, "assert_factory_complete", gate_then_let_a_second_instance_finish):
+        with contextlib.suppress(FileNotFoundError, ValueError):
+            apply_update(root, ch.as_uri(), pub, _ws(tmp_path))
+
+    assert (root / "current.txt").read_text(encoding="utf-8").strip() == "0.1.2"
+    assert (root / "versions" / "0.1.2" / "marker.txt").exists(), "current.txt 指向的版本目录被删了"
 
 
 def test_signed_but_malformed_manifest_fails_with_a_readable_error(tmp_path: Path):
@@ -531,4 +587,344 @@ def test_signed_but_malformed_manifest_fails_with_a_readable_error(tmp_path: Pat
     (root / "current.txt").write_text("0.1.0", encoding="utf-8")
 
     with pytest.raises(ValueError, match="清单"):
-        apply_update(root, ch.as_uri(), priv.public_key().public_bytes_raw().hex())
+        apply_update(root, ch.as_uri(), priv.public_key().public_bytes_raw().hex(), _ws(tmp_path))
+
+
+def test_staging_path_is_not_much_longer_than_the_final_one(tmp_path: Path):
+    """Win10/11 家庭版默认没开 LongPathsEnabled，MAX_PATH=260。最终布局实测 68 字符，
+    而 node_modules 嵌套很深——staging 目录名每多一个字符，整棵树里最长的那条路径就
+    多一个字符。旧名字 `.staging-<version>-<pid>-<uuid8>` 比最终名字长 24 个字符。
+
+    咬到的时候会怎样：extractall 抛的 OSError **不在** `except _UNREACHABLE` 的覆盖
+    范围里（那个 except 只包着 _download），于是异常一路逃到 main()，SystemExit(1)。
+    每次开机重下 895MB、失败、退出 1，永远装不上——把爸妈的带宽烧光，维护者收不到
+    任何信号。
+
+    锁已经提供了互斥（见 _try_lock），staging 名字里再放版本号和 pid 是冗余的。"""
+    ch, pub, _ = _channel(tmp_path, "0.1.1")
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "current.txt").write_text("0.1.0", encoding="utf-8")
+
+    seen = []
+    real_extractall = zipfile.ZipFile.extractall
+
+    def record(self, path):
+        seen.append(Path(path).name)
+        real_extractall(self, path)
+
+    with patch.object(zipfile.ZipFile, "extractall", record):
+        assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) == "0.1.1"
+
+    assert len(seen) == 1
+    staging_name, final_name = seen[0], "0.1.1"
+    assert len(staging_name) - len(final_name) <= 6, f"staging 目录名太长：{staging_name}"
+    assert staging_name.startswith(".")  # 点开头：_prune_old_versions 不会把它当成版本目录
+
+
+def test_update_applies_the_new_versions_factory_state_to_data(tmp_path: Path):
+    """发行版 = 钉死的 Hermes + 出厂配置/persona/技能（ADR-0003）。更新只换代码、
+    不把新版本的出厂状态应用到 data/ 的话，"改一行 SOUL.md 发个新版"永远不生效
+    ——而那正是 Task 10 的验收项。"""
+    ch, pub, _ = _channel(tmp_path, "0.1.1")
+    root = tmp_path / "root"
+    (root / "versions" / "0.1.0").mkdir(parents=True)
+    (root / "current.txt").write_text("0.1.0", encoding="utf-8")
+    workspace = _ws(tmp_path)
+
+    assert apply_update(root, ch.as_uri(), pub, workspace) == "0.1.1"
+
+    data = root / "data"
+    assert (data / "SOUL.md").read_text(encoding="utf-8") == "我是小助手 0.1.1"
+    assert (data / "skills" / "creative" / "ascii-art" / "SKILL.md").read_text(
+        encoding="utf-8"
+    ) == "出厂技能 0.1.1"
+    loaded = yaml.safe_load((data / "config.yaml").read_text(encoding="utf-8"))
+    assert loaded["model"]["default"] == "0.1.1"
+    assert loaded["terminal"]["cwd"] == str(workspace)  # 占位符被渲染成了真实工作台
+    assert not (data / "config.yaml.tmpl").exists()
+
+
+def test_update_never_strands_the_users_own_data(tmp_path: Path):
+    """铁律二。这条测试是整个布局返工的理由：旧布局把 .env / 聊天记录 / 习得技能
+    都放在 versions/<v>/ 里，第一次自动更新就会把它们连同旧版本目录一起剪掉——
+    激活码没了 = 产品直接变砖，静默发生，一万公里外收不到信号。"""
+    ch, pub, priv = _channel(tmp_path, "0.1.1")
+    root = tmp_path / "root"
+    (root / "versions" / "0.1.0").mkdir(parents=True)
+    (root / "current.txt").write_text("0.1.0", encoding="utf-8")
+
+    data = root / "data"
+    (data / "sessions").mkdir(parents=True)
+    (data / "sessions" / "chat.jsonl").write_text("聊天记录", encoding="utf-8")
+    (data / "memories").mkdir()
+    (data / "memories" / "notes.md").write_text("记住的事", encoding="utf-8")
+    (data / ".env").write_text("DASHSCOPE_API_KEY=sk-keep-me", encoding="utf-8")
+    learned = data / "skills" / "business" / "quote-sheet" / "SKILL.md"
+    learned.parent.mkdir(parents=True)
+    learned.write_text("习得技能", encoding="utf-8")
+
+    assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) == "0.1.1"
+    _publish(ch, "0.1.2", priv)
+    assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) == "0.1.2"  # 再更新一次，触发剪枝
+
+    assert (data / ".env").read_text(encoding="utf-8") == "DASHSCOPE_API_KEY=sk-keep-me"
+    assert (data / "sessions" / "chat.jsonl").read_text(encoding="utf-8") == "聊天记录"
+    assert (data / "memories" / "notes.md").read_text(encoding="utf-8") == "记住的事"
+    assert learned.read_text(encoding="utf-8") == "习得技能"
+
+
+def test_a_failed_factory_apply_converges_on_the_next_run(tmp_path: Path):
+    """应用出厂状态是在**提交点之后**（current.txt 已经切了）跑的，没有回头路。
+
+    它失败一次（杀软锁了 skills/、权限、磁盘满）之后，旧代码里机器就**永久**停在
+    "新代码 + 旧 persona + 旧配置"上：下一次开机，parse_version(0.1.1) <= parse_version
+    (0.1.1) → return None → 印「已是最新版本，无需更新」→ 退出 0。心跳还报着新版本号，
+    维护者收不到任何信号。维护者为"别再瞎编价格"发一版 SOUL.md 修复，它永远不会落地。
+
+    更新器必须在每次运行的开头（它每次登录都跑、而且持着锁）对着 current.txt 校对出厂
+    状态戳，缺了/旧了就先重新应用一遍——自愈，不依赖任何还不存在的启动器。"""
+    ch, pub, _ = _channel(tmp_path, "0.1.1")
+    root = tmp_path / "root"
+    (root / "versions" / "0.1.0").mkdir(parents=True)
+    (root / "current.txt").write_text("0.1.0", encoding="utf-8")
+    data = root / "data"
+    data.mkdir()
+    (data / "SOUL.md").write_text("我是小助手 0.1.0", encoding="utf-8")
+
+    boom = RuntimeError("杀软锁住了 data/skills/")
+    with patch.object(updater, "apply_factory_state", side_effect=boom):
+        with pytest.raises(RuntimeError):
+            apply_update(root, ch.as_uri(), pub, _ws(tmp_path))
+
+    # 提交点已经过了：机器在跑新代码，但 persona 还是旧的。这是可收敛的中间态。
+    assert (root / "current.txt").read_text(encoding="utf-8") == "0.1.1"
+    assert (data / "SOUL.md").read_text(encoding="utf-8") == "我是小助手 0.1.0"
+
+    # 下一次开机：通道里还是 0.1.1（"已是最新"），机器必须自己收敛。
+    assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) is None
+    assert (data / "SOUL.md").read_text(encoding="utf-8") == "我是小助手 0.1.1"
+    assert (data / "skills" / "creative" / "ascii-art" / "SKILL.md").read_text(
+        encoding="utf-8"
+    ) == "出厂技能 0.1.1"
+
+
+def test_a_successful_update_stamps_the_applied_factory_version(tmp_path: Path):
+    """戳是"出厂状态已经收敛到这个版本"的唯一凭据。不落戳的话，自愈逻辑要么永远不跑
+    （假设切了版本就等于应用过），要么每次开机把 2.87GB 的出厂状态重铺一遍。"""
+    ch, pub, _ = _channel(tmp_path, "0.1.1")
+    root = tmp_path / "root"
+    (root / "versions" / "0.1.0").mkdir(parents=True)
+    (root / "current.txt").write_text("0.1.0", encoding="utf-8")
+
+    assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) == "0.1.1"
+    stamp = (root / "data" / FACTORY_STAMP).read_text(encoding="utf-8").strip()
+    assert stamp == "0.1.1"
+
+
+def test_a_corrupt_installed_factory_master_does_not_sever_the_update_channel(tmp_path: Path):
+    """当前版本的出厂母版在装好**之后**被弄坏了（杀软隔离了 SOUL.md、磁盘错误），戳也没对上。
+
+    自愈这一步收敛不过去（母版不合格，没有可收敛的目标）——但它绝不能因此抛异常把整次更新
+    带崩：更新器是这台机器唯一的远程修复通道（builder/paths.py），而下一个发行版带的是一份
+    全新的、切版本前就校验过的母版，那正是这台机器的出路。在自愈里硬抛 = 每次开机
+    SystemExit(1) = 亲手把唯一的救援通道拆了。"""
+    ch, pub, _ = _channel(tmp_path, "0.1.1")
+    root = tmp_path / "root"
+    broken = root / "versions" / "0.1.0" / "factory"
+    broken.mkdir(parents=True)
+    (broken / "config.yaml.tmpl").write_text(
+        'terminal:\n  cwd: "{{WORKSPACE_DIR}}"\n', encoding="utf-8"
+    )  # SOUL.md 和 skills/ 没了 → 母版不合格
+    (root / "current.txt").write_text("0.1.0", encoding="utf-8")
+
+    assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) == "0.1.1"
+
+    data = root / "data"
+    assert (data / "SOUL.md").read_text(encoding="utf-8") == "我是小助手 0.1.1"
+    assert (data / FACTORY_STAMP).read_text(encoding="utf-8").strip() == "0.1.1"
+
+
+def test_a_symlinked_data_skills_is_refused_before_the_switch(tmp_path: Path):
+    """data/skills 是符号链接 = **机器状态**问题，不是"重跑就好"的 I/O 抖动：它每次运行
+    都以完全相同的方式失败。在切 current.txt 之后才撞见它，机器就永久停在"新代码 + 旧
+    出厂状态"上，而更新器每次开机都报「已是最新版本」。所以这道闸门必须在提交点之前。"""
+    ch, pub, _ = _channel(tmp_path, "0.1.1")
+    root = tmp_path / "root"
+    (root / "versions" / "0.1.0").mkdir(parents=True)
+    (root / "current.txt").write_text("0.1.0", encoding="utf-8")
+    data = root / "data"
+    data.mkdir()
+    outside = tmp_path / "outside-skills"
+    outside.mkdir()
+    (data / "skills").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError):
+        apply_update(root, ch.as_uri(), pub, _ws(tmp_path))
+
+    assert (root / "current.txt").read_text(encoding="utf-8") == "0.1.0"  # 生效开关没动
+    assert not (root / "versions" / "0.1.1").exists()
+    assert not list(outside.iterdir())  # 一个字节都没写到 hermes_home 之外
+    assert not list((root / "versions").glob(".s-*")), "拒绝之后不能留下几个 GB 的 staging 垃圾"
+
+
+def test_orphan_staging_dir_from_an_older_updater_is_reclaimed(tmp_path: Path):
+    """上一版更新器留下的 staging 目录叫 `.staging-<version>-<pid>-<uuid8>`（本版改成了
+    `.s-<uuid8>`）。它是磁盘上一个 2.87GB 的孤儿：清理只 glob `.s-*` 就够不着它，
+    _prune_old_versions 又跳过点开头的名字——于是它永远收不回来，还会把 _require_free_space
+    永久压在"空间不够"那一侧：这台机器再也收不到任何更新（包括安全更新）。"""
+    ch, pub, _ = _channel(tmp_path, "0.1.1")
+    root = tmp_path / "root"
+    (root / "versions" / "0.1.0").mkdir(parents=True)
+    (root / "current.txt").write_text("0.1.0", encoding="utf-8")
+    orphan = root / "versions" / ".staging-0.1.0-4242-deadbeef"
+    (orphan / "hermes-agent" / "node_modules").mkdir(parents=True)
+    (orphan / "hermes-agent" / "node_modules" / "blob.bin").write_bytes(b"x" * 4096)
+
+    assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) == "0.1.1"
+    assert not orphan.exists(), "上一版更新器的 staging 孤儿永远收不回来"
+
+
+def test_package_without_a_factory_master_is_refused_before_the_switch(tmp_path: Path):
+    """出厂母版缺失/不完整 = 维护者的打包流程出了 bug（内容不合法，不是"网络不好"）。
+    必须在切 current.txt **之前**就拒绝：切过去之后才发现的话，机器已经跑在新代码上，
+    却只有一半的出厂状态，谁也说不清它在什么状态。宁可停在旧版本、响亮地失败。"""
+    ch = tmp_path / "channel"
+    ch.mkdir()
+    priv = Ed25519PrivateKey.generate()
+    pkg = ch / "dist-0.1.1.zip"
+    with zipfile.ZipFile(pkg, "w") as z:
+        z.writestr("marker.txt", "0.1.1")  # 没有 factory/
+    manifest = json.dumps({
+        "version": "0.1.1",
+        "package": pkg.name,
+        "sha256": hashlib.sha256(pkg.read_bytes()).hexdigest(),
+    }).encode()
+    (ch / "manifest.json").write_bytes(manifest)
+    (ch / "manifest.sig").write_bytes(base64.b64encode(priv.sign(manifest)))
+
+    root = tmp_path / "root"
+    (root / "versions" / "0.1.0").mkdir(parents=True)
+    (root / "current.txt").write_text("0.1.0", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        apply_update(root, ch.as_uri(), priv.public_key().public_bytes_raw().hex(), _ws(tmp_path))
+
+    assert (root / "current.txt").read_text(encoding="utf-8") == "0.1.0"
+    assert not (root / "versions" / "0.1.1").exists()
+    assert not list((root / "versions").glob(".s-*")), "拒绝之后不能留下几个 GB 的 staging 垃圾"
+
+
+def _valid_factory_master(factory: Path, version: str) -> None:
+    """在 factory 目录下铺一份形状完整、能通过 assert_factory_complete 的出厂母版。"""
+    factory.mkdir(parents=True)
+    (factory / "config.yaml.tmpl").write_text(
+        f'model:\n  default: "{version}"\nterminal:\n  cwd: "{{{{WORKSPACE_DIR}}}}"\n',
+        encoding="utf-8",
+    )
+    (factory / "SOUL.md").write_text(f"我是小助手 {version}", encoding="utf-8")
+    skill = factory / "skills" / "creative" / "ascii-art" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(f"出厂技能 {version}", encoding="utf-8")
+
+
+def test_reconcile_survives_an_unreadable_current_factory_master(tmp_path: Path):
+    """Path B：当前版本（0.1.0）的出厂母版**存在但读不出来**——杀软"隔离"惯常的做法是
+    锁住文件而不是删除它，磁盘读错误同理——两者都抛 OSError（更准确地说是它的子类
+    PermissionError），不是 ValueError。
+
+    `assert_factory_complete` 走到最后一步 `read_text()` 校验模板占位符时撞见它，
+    异常从 `except ValueError` 手缝里逃出去，一路逃到 main()：SystemExit(1) 挂在每次
+    开机上。而这次通道里恰好摆着 0.1.1——本该救这台机器的那个新版本——旧代码里它永远
+    装不上：堵死更新通道的后果比"跳过一次自愈"糟得多得多。"""
+    ch, pub, _ = _channel(tmp_path, "0.1.1")
+    root = tmp_path / "root"
+    factory = root / "versions" / "0.1.0" / "factory"
+    _valid_factory_master(factory, "0.1.0")
+    os.chmod(factory / "config.yaml.tmpl", 0)  # 杀软"锁住"而非删除：读的时候抛 PermissionError
+    (root / "current.txt").write_text("0.1.0", encoding="utf-8")
+
+    assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) == "0.1.1"
+
+    data = root / "data"
+    assert (data / "SOUL.md").read_text(encoding="utf-8") == "我是小助手 0.1.1"
+    assert (data / FACTORY_STAMP).read_text(encoding="utf-8").strip() == "0.1.1"
+
+
+def test_reconcile_survives_its_own_apply_hitting_an_unwritable_data_dir(tmp_path: Path):
+    """Path C（第一种复现）：当前版本的母版完全合格，但 data/ 本身被杀软的目录保护
+    锁成只读（中国杀软套装的常见行为）。`_reconcile_factory_state` 里 `apply_factory_state`
+    这次调用**在 try 之外**，写文件时抛出的 PermissionError 会绕开"母版不可用就跳过"
+    那份宽容、原样逃到 main()——在任何网络调用**之前**就 SystemExit(1)，每次开机都这样，
+    机器永远联系不上通道。
+
+    通道里摆的仍是当前这个版本（"已是最新"），这样断言只盯住 reconcile 自己这一步的
+    行为，不牵扯它之后的主更新路径。"""
+    ch, pub, _ = _channel(tmp_path, "0.1.0")
+    root = tmp_path / "root"
+    factory = root / "versions" / "0.1.0" / "factory"
+    _valid_factory_master(factory, "0.1.0")
+    (root / "current.txt").write_text("0.1.0", encoding="utf-8")
+    data = root / "data"
+    data.mkdir()
+    os.chmod(data, 0o500)  # 读+执行，无写：目录保护型杀软锁住 data/ 的典型表现
+    try:
+        assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) is None  # 已是最新，且没有崩
+    finally:
+        os.chmod(data, 0o700)  # 还原权限，让 tmp_path 的清理逻辑能删掉这棵树
+
+    # 戳没落：没有在假装已经收敛，下一次开机会照样重试自愈。
+    assert not (data / FACTORY_STAMP).exists()
+
+
+def test_reconcile_survives_its_own_apply_hitting_a_symlinked_skills_dir(tmp_path: Path):
+    """Path C（第二种复现）：当前版本的母版完全合格，但 data/skills 是符号链接。
+    `apply_factory_state` 内部的 `assert_skills_not_symlink` 抛 ValueError——异常类型
+    虽然和"母版不可用"那支 except 匹配，但这次调用本身**在 try 之外**，同样会原样
+    逃到 main()：SystemExit(1) 挂在每次开机上，在任何网络调用之前。"""
+    ch, pub, _ = _channel(tmp_path, "0.1.0")
+    root = tmp_path / "root"
+    factory = root / "versions" / "0.1.0" / "factory"
+    _valid_factory_master(factory, "0.1.0")
+    (root / "current.txt").write_text("0.1.0", encoding="utf-8")
+    data = root / "data"
+    data.mkdir()
+    outside = tmp_path / "outside-skills"
+    outside.mkdir()
+    (data / "skills").symlink_to(outside, target_is_directory=True)
+
+    assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) is None  # 已是最新，且没有崩
+
+    assert not list(outside.iterdir())  # 一个字节都没写到 hermes_home 之外
+    assert not (data / FACTORY_STAMP).exists()  # 戳没落：下一次开机照样重试自愈
+
+
+def test_reconcile_survives_an_unreadable_factory_stamp(tmp_path: Path):
+    """Path A：母版完全合格、data/ 可写，但**戳自己**读不出来。
+
+    戳（data/.factory_version）住在 data/ 里——那正是最容易被杀软和长辈碰到的那棵树。
+    杀软"隔离"锁住它（而不是删除它）之后，`is_file()` 照样为真，撞的是 `read_text()`
+    那一下：PermissionError。而 `factory_state_is_current` 这次调用曾经**在 try 之外**，
+    于是这个异常绕开"收敛不了就跳过"那份宽容、原样逃到 main()——在任何网络调用之前就
+    SystemExit(1)，每次开机都这样。
+
+    通道里恰好摆着 0.1.1（本该救这台机器的那个新版本）：自愈的一次失败绝不能连带堵死
+    更新通道本身——那是这个函数存在的全部理由。"""
+    ch, pub, _ = _channel(tmp_path, "0.1.1")
+    root = tmp_path / "root"
+    _valid_factory_master(root / "versions" / "0.1.0" / "factory", "0.1.0")
+    (root / "current.txt").write_text("0.1.0", encoding="utf-8")
+    data = root / "data"
+    data.mkdir(parents=True)
+    stamp = data / FACTORY_STAMP
+    stamp.write_text("0.1.0", encoding="utf-8")
+    os.chmod(stamp, 0)  # 杀软"锁住"而非删除：读的时候抛 PermissionError
+
+    try:
+        assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) == "0.1.1"
+    finally:
+        os.chmod(stamp, 0o600)  # 还原权限，让 tmp_path 的清理逻辑能删掉这棵树
+
+    # 更新通道没被堵死：0.1.1 装上了，而且它的出厂状态落到了 data/（戳被重新写过）。
+    assert (data / "SOUL.md").read_text(encoding="utf-8") == "我是小助手 0.1.1"
+    assert stamp.read_text(encoding="utf-8").strip() == "0.1.1"

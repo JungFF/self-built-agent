@@ -44,7 +44,16 @@
    不是合法 JSON，都必须清晰地抛异常——宽容的是网络，不是内容。已拉黑的版本
    （bad_versions.txt，由 Task 6 启动器在版本启动即崩时写入）永远不再自动
    装，否则会陷入“装 → 崩 → 回滚 → 又装 → 又崩”的死循环，机器彻底废掉。
+
+5. 更新不只换代码，还要把新版本的**出厂状态**应用到 data/（tools/factory_state.py，
+   铁律三）。只换 versions/<v>/ 的话，新版本永远改不了 persona/配置——而 ADR-0003 里
+   “发行版”的定义恰恰是“钉死的 Hermes + 出厂配置/persona/技能”。反过来，data/ 里
+   属于用户的东西（.env、sessions、memories、习得技能）绝不能被更新碰到一个字节：
+   旧布局把它们放在 versions/<v>/ 里，第一次自动更新就会连同旧版本目录一起剪掉，
+   激活码没了 = 产品直接变砖。出厂母版在切版本**之前**校验（不合格的包整个拒掉），
+   出厂状态在切版本**之后**应用（失败态分析见 factory_state 的模块 docstring）。
 """
+import argparse
 import base64
 import errno
 import hashlib
@@ -52,7 +61,6 @@ import http.client
 import json
 import os
 import shutil
-import sys
 import urllib.request
 import uuid
 import zipfile
@@ -64,8 +72,21 @@ from builder.paths import (
     BAD_VERSIONS_FILE,
     CHANNEL_FILE,
     CURRENT_FILE,
+    DATA_DIR_REL,
+    FACTORY_DIR_REL,
+    LOCK_FILE,
     PREVIOUS_FILE,
     VERSIONS_DIR,
+)
+from tools.factory_state import (
+    apply_factory_state,
+    assert_factory_complete,
+    atomic_write,
+    default_workspace_dir,
+    factory_master,
+    factory_state_is_current,
+    precheck_machine_state,
+    tmp_path,
 )
 
 if os.name == "nt":
@@ -74,8 +95,29 @@ else:
     import fcntl
 
 _DOWNLOAD_TMP_NAME = "download.tmp.zip"
-_LOCK_NAME = "update.lock"
 _CHUNK_SIZE = 1024 * 1024
+
+# staging 目录名必须**尽量短**。Win10/11 家庭版默认没开 LongPathsEnabled，MAX_PATH=260；
+# 最终布局实测 68 字符（安全），但解压是在 versions/<staging>/ 底下做的，而 node_modules
+# 嵌套很深——staging 名字每多一个字符，树里最长的那条路径就多一个字符。
+# `.staging-<version>-<pid>-<uuid8>` 比最终名字长 24 个字符，`.s-<uuid8>` 只长 6 个。
+#
+# 长到咬人时会发生什么：extractall 抛的 OSError **不在** `except _UNREACHABLE` 的覆盖
+# 范围里（那个 except 只包着 _download），异常一路逃到 main() → SystemExit(1)。于是
+# 每次开机重下 895MB、解压失败、退出 1，永远装不上——把爸妈的带宽烧光，而维护者收不到
+# 任何信号。
+#
+# 版本号和 pid 从名字里拿掉不影响互斥：互斥是 _try_lock 那把 OS 级排他锁提供的，随机
+# 后缀只是"锁万一在某个诡异文件系统上失灵"时的最后一点防撞。
+_STAGING_PREFIX = ".s-"
+
+# 清理时要认的**全部**历史 staging 前缀。上一版更新器用的是 `.staging-<version>-<pid>-<uuid8>`，
+# 而更新器自己是随版本下发的——所以磁盘上完全可能躺着一个由旧更新器留下的 `.staging-*` 孤儿
+# （它崩在解压中途，然后这台机器更新到了带新前缀的这一版）。只 glob `.s-*` 够不着它，
+# _prune_old_versions 又跳过点开头的名字：那 2.87GB 就**永远**收不回来，还会把
+# _require_free_space 永久压在"空间不够"那一侧——这台机器从此再也收不到任何更新。
+# 下一个发行版之后可以把 `.staging-` 拿掉（那时磁盘上不可能再有旧前缀的孤儿）。
+_STALE_STAGING_PREFIXES = (_STAGING_PREFIX, ".staging-")
 
 # 解压后约是压缩包的 3.2 倍（895MB → 2.87GB），加上压缩包自身 1 份，再留点余量。
 _SPACE_FACTOR = 4.5
@@ -206,7 +248,7 @@ def _try_lock(install_root: Path):
     根 = 没有东西可更新，安静退出即可。
     """
     try:
-        fh = (install_root / _LOCK_NAME).open("a+b")  # 不截断：锁文件长期存在，内容无关紧要
+        fh = (install_root / LOCK_FILE).open("a+b")  # 不截断：锁文件长期存在，内容无关紧要
     except OSError:
         return None
     try:
@@ -248,20 +290,14 @@ def _bad_versions(install_root: Path) -> set[str]:
     return set(f.read_text(encoding="utf-8").split()) if f.exists() else set()
 
 
-def _tmp_path(path: Path) -> Path:
-    """临时文件的命名规则：目标文件同目录、同名加 .tmp 后缀。同目录是硬要求
-    ——os.replace 只有在同一个文件系统内才是原子换名。_atomic_write 写的和
-    _cleanup_stale_temp 清的必须是同一个位置，所以这条规则只定义在这一处。"""
-    return path.with_name(path.name + ".tmp")
-
-
 def _atomic_write(path: Path, text: str) -> None:
-    """写临时文件再 os.replace 换名。os.replace 在 POSIX 和 Windows 上都是
-    目录项的原子替换，不存在"写到一半被打断"的中间状态——path 要么是
-    替换前的旧内容，要么是完整的新内容，不会是截断了一半的字符串。"""
-    tmp = _tmp_path(path)
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    """current.txt / previous.txt 的写入口（都是纯文本）。
+
+    落盘机制不在这里实现：写 .tmp + os.replace 换名（"要么整份旧、要么整份新，绝不留下
+    截断的半个文件"）与出厂状态的写入共用 factory_state.atomic_write 那一份实现。两份
+    实现会静默分叉，而临时文件的命名规则同时还是 _cleanup_stale_temp 的清理依据
+    （factory_state.tmp_path）——写的和清的一旦对不上，孤儿临时文件就永远收不回来。"""
+    atomic_write(path, text.encode("utf-8"))
 
 
 def _cleanup_stale_temp(install_root: Path) -> None:
@@ -276,11 +312,12 @@ def _cleanup_stale_temp(install_root: Path) -> None:
     current.txt 指向一块虚空。锁文件本身（update.lock）不在清理范围内。"""
     (install_root / _DOWNLOAD_TMP_NAME).unlink(missing_ok=True)
     for name in (CURRENT_FILE, PREVIOUS_FILE):
-        _tmp_path(install_root / name).unlink(missing_ok=True)
+        tmp_path(install_root / name).unlink(missing_ok=True)
     versions_dir = install_root / VERSIONS_DIR
     if versions_dir.is_dir():
-        for stale in versions_dir.glob(".staging-*"):
-            shutil.rmtree(stale, ignore_errors=True)
+        for prefix in _STALE_STAGING_PREFIXES:
+            for stale in versions_dir.glob(f"{prefix}*"):
+                shutil.rmtree(stale, ignore_errors=True)
 
 
 def _prune_old_versions(install_root: Path, keep: set[str]) -> None:
@@ -313,22 +350,140 @@ def _drop_lying_previous(install_root: Path) -> None:
         f.unlink(missing_ok=True)
 
 
-def apply_update(install_root: Path, channel_url: str, pubkey_hex: str) -> str | None:
+def apply_update(
+    install_root: Path, channel_url: str, pubkey_hex: str, workspace_dir: Path
+) -> str | None:
     """检查通道，必要时静默安装新版本。返回新版本号，或 None（已是最新 /
-    通道当前不可达 / 磁盘空间不够 / 新版本已被拉黑 / 另一个实例正在更新）。"""
+    通道当前不可达 / 磁盘空间不够 / 新版本已被拉黑 / 另一个实例正在更新）。
+
+    workspace_dir（桌面的「小助手」文件夹）要**显式传进来**，本模块不自己去推导：
+    推导（default_workspace_dir）只发生在 main() 那一层。这样测试里不会有哪个用例
+    在开发机/CI 的真实桌面上凭空建出一个「小助手」文件夹来。
+    """
     lock = _try_lock(install_root)
     if lock is None:
         # 另一个实例正在更新同一个共享安装根。这不是错误：安静让路，那个实例
         # 会把活干完；真要有什么没干完，下次开机再跑一次就是了。
         return None
     try:
-        return _apply_update_locked(install_root, channel_url.rstrip("/"), pubkey_hex)
+        return _apply_update_locked(
+            install_root, channel_url.rstrip("/"), pubkey_hex, workspace_dir
+        )
     finally:
         _unlock(lock)
 
 
-def _apply_update_locked(install_root: Path, channel_url: str, pubkey_hex: str) -> str | None:
+def _reconcile_factory_state(install_root: Path, workspace_dir: Path) -> None:
+    """自愈：current.txt 指着的那个版本，它的出厂状态**真的**落到 data/ 上了吗？
+
+    出厂状态是在切完 current.txt 之后才应用的（顺序反过来更危险，见 factory_state 的模块
+    docstring），也就是说它落在提交点之后。它失败一次（杀软锁了某个文件、磁盘瞬时满），
+    机器就停在"新代码 + 旧 persona + 旧配置"上——而这个中间态**不会自己好起来**：下一次
+    开机，parse_version(新) <= parse_version(current) → return None → 印「已是最新版本」→
+    退出 0。心跳还报着新版本号。维护者为"别再瞎编价格"发的那版 SOUL.md 修复，永远不会落地，
+    而且他收不到任何信号。这正是本项目最坏的那类故障：一个报告成功的静默空操作。
+
+    所以每次运行（更新器每次登录都跑，而且此刻正持着锁）先拿 current.txt 跟 data/ 里的戳
+    对一下，对不上就把出厂状态重新应用一遍——**必须在"已是最新、无需更新"那个提前返回之前**，
+    也必须在任何网络调用之前（通道够不到是常态，收敛不能等一个可能永远不来的新版本）。
+
+    Task 6 的启动器也该做同样的校对（纵深防御），但更新器不能依赖它：启动器还不存在，
+    而这个故障今天就已经能发生了。
+
+    本函数必须**结构上不可能向外抛**。收敛只有一种机制：戳没落，下次开机重跑。所以吞掉
+    一次失败的代价只是"多停一个开机周期的旧 persona"；而让它抛出去的代价是 SystemExit(1)
+    挂在**每次**开机上——更新器是这台机器唯一的远程修复通道（见 builder/paths.py），抛
+    出去等于亲手拆掉它：连能救这台机器的下一个发行版都装不上。这两种代价完全不对称，
+    所以下面的 try 必须盖住这条路上的**每一次读写**（漏掉任何一次，那一次就是逃逸路径）、
+    **同时**接住两类异常：
+
+    - factory_state_is_current 读 data/.factory_version 这个戳：见 try 里的注释——戳是
+      data/ 里的文件，被杀软锁住就读不出来（PermissionError），被写坏就解不出 UTF-8
+      （UnicodeDecodeError，ValueError 的子类）。
+    - assert_factory_complete 校验当前版本的母版：不存在/不完整时抛 ValueError（母版
+      从来没带、或者装好之后整个被删/被换了内容）；但杀软"隔离"惯常的做法是**锁住**
+      文件而不是删除它——锁住的文件对 is_dir()/is_file() 照样健在，撞的是后面
+      read_text() 那一下，抛的是 PermissionError（OSError 的子类），不是 ValueError。
+      磁盘读错误同理是 OSError。只接 ValueError 的话，这两种"母版其实还在、只是读不出来"
+      的情况会一路逃出这个函数。
+    - apply_factory_state 真正把母版落到 data/：即便母版本身完全合格，这台机器也可能
+      应用不上——data/ 被杀软的目录保护锁成只读（中国杀软套装常见行为）会在写文件时抛
+      PermissionError；data/skills 是符号链接会被它内部的 assert_skills_not_symlink 抛
+      ValueError。这两种失败和"母版不合格"是同一个范畴——机器状态问题，不是内容不可信
+      ——必须和上面那次调用共享同一条"吞掉、下次重试"的收敛路径，而不是被排除在 try 之外、
+      绕开这份宽容、原样逃到 main()。
+
+    注意这不是"静默的空操作"：机器没有在假装自己已经是新出厂状态（戳还停在旧版本，
+    下一次更新会把它补上），而且这条中文提示在维护者远程 ToDesk 手动跑更新时看得见。
+    """
+    version = _current(install_root)
+    if version is None:
+        return  # 还没装过任何版本，没有"该收敛到哪儿"可言
+
+    try:
+        # 读戳本身也必须在 try 里面。戳是 data/ 里的文件，而 data/ 正是最容易被杀软和长辈
+        # 碰到的那棵树：被"隔离"锁住的 .factory_version 对 is_file() 照样健在，撞的是
+        # read_text() 那一下（PermissionError）；被写坏成非 UTF-8 则抛 UnicodeDecodeError
+        # （ValueError 的子类）。把这一句留在 try 之外，等于给这个函数留了唯一一条逃逸路径
+        # ——而逃出去的代价就是本函数存在的全部理由：SystemExit(1) 挂在每次开机上，连能救
+        # 这台机器的下一个发行版都装不上。读不出戳 = 无法证明已收敛，按"没收敛"处理即可。
+        if factory_state_is_current(install_root, version):
+            return  # 戳对得上：data/ 已经是这个版本的出厂状态（绝大多数开机走这条快路）
+
+        # 必须和下面 apply_factory_state 真正读取的是同一个母版路径（factory_master 只定义
+        # 在一处）：校验了 A、应用了 B 的话，戳照样会落下去，而出厂状态来自别处。
+        assert_factory_complete(factory_master(install_root, version))
+        apply_factory_state(install_root, version, workspace_dir)
+    except (ValueError, OSError) as exc:
+        # 戳读不出来、母版不可用（缺失、被弄坏、被杀软锁住读不出来），或者母版本身没问题
+        # 但这台机器套用不上（data/ 只读、data/skills 是符号链接）——都收敛不到，但**绝不能**
+        # 因此把更新通道也一起堵死：下一个发行版带的母版会在切版本前被校验、切完之后被
+        # 应用——那才是这台机器的出路。在这里抛异常 = 每次开机 SystemExit(1)、永远装不上
+        # 新版本 = 亲手拆掉唯一的救援通道。
+        print(f"小助手：当前版本的出厂状态自愈失败（{exc}）——跳过，继续检查更新")
+
+
+def _stage_package(
+    install_root: Path, channel_url: str, package: str, want_sha256: str
+) -> Path | None:
+    """下载 → 校验 sha256 → 解压进一个 staging 目录，返回它的路径。
+
+    这里就是"宽容网络、绝不宽容内容"那条分界线（模块 docstring 第 4 条）：
+    - 通道够不到（断网 / 超时 / 中途断流 / 磁盘空间不够）→ 返回 None，静默把重试留给
+      下一次开机。此时 current.txt 一个字节都没被碰过，机器状态完全没变。
+    - 包对不上 sha256（被篡改或下载损坏）→ 抛。绝不能把一个不可信的包解压进 versions/。
+
+    解压失败（比如 MAX_PATH 咬人）留下的半棵 staging 树不在这里清：它从未被 current.txt
+    引用过，是安全孤儿，由下一次运行的 _cleanup_stale_temp 无条件收走。
+    """
+    tmp_zip = install_root / _DOWNLOAD_TMP_NAME
+    try:
+        try:
+            got_sha256 = _download(f"{channel_url}/{package}", tmp_zip)
+        except _UNREACHABLE:
+            return None
+
+        if got_sha256 != want_sha256:
+            raise ValueError(f"sha256 mismatch：包被篡改或下载损坏（{package}）")
+
+        # staging 目录名带随机串：即便锁机制在某个诡异的文件系统上失灵，两个实例
+        # 也不会撞到同一个 staging 目录名上、把对方的树解压进自己的树。名字为什么
+        # 必须短（而不是把版本号和 pid 也拼进来）见 _STAGING_PREFIX 的注释。
+        # （versions/ 到这一步才建：包没通过校验之前，安装根上不留任何痕迹。）
+        staging = install_root / VERSIONS_DIR / f"{_STAGING_PREFIX}{uuid.uuid4().hex[:8]}"
+        staging.mkdir(parents=True)
+        with zipfile.ZipFile(tmp_zip) as z:
+            z.extractall(staging)
+        return staging
+    finally:
+        tmp_zip.unlink(missing_ok=True)
+
+
+def _apply_update_locked(
+    install_root: Path, channel_url: str, pubkey_hex: str, workspace_dir: Path
+) -> str | None:
     _cleanup_stale_temp(install_root)  # 锁在手，磁盘上的临时产物一定是孤儿
+    _reconcile_factory_state(install_root, workspace_dir)  # 先自愈，再谈更新
 
     try:
         manifest_bytes = _fetch(f"{channel_url}/manifest.json")
@@ -346,27 +501,26 @@ def _apply_update_locked(install_root: Path, channel_url: str, pubkey_hex: str) 
     if new_version in _bad_versions(install_root):
         return None  # 拉黑过的版本不再自动装，否则会陷入装→崩→回滚的死循环
 
+    staging = _stage_package(install_root, channel_url, package, want_sha256)
+    if staging is None:
+        return None  # 通道够不到：current.txt 没被碰过，机器状态完全没变，下次开机再试
+
     versions_dir = install_root / VERSIONS_DIR
-    tmp_zip = install_root / _DOWNLOAD_TMP_NAME
     try:
-        try:
-            got_sha256 = _download(f"{channel_url}/{package}", tmp_zip)
-        except _UNREACHABLE:
-            # 下载中途断网 / 磁盘空间不够：current.txt 还没被碰过，机器状态完全没变。
-            return None
-
-        if got_sha256 != want_sha256:
-            raise ValueError(f"sha256 mismatch：包被篡改或下载损坏（{package}）")
-
-        # staging 目录名带 pid + 随机串：即便锁机制在某个诡异的文件系统上失灵，
-        # 两个实例也不会撞到同一个 staging 目录名上、把对方的树解压进自己的树。
-        # （versions/ 到这一步才建：包没通过校验之前，安装根上不留任何痕迹。）
-        staging = versions_dir / f".staging-{new_version}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-        staging.mkdir(parents=True)
-        with zipfile.ZipFile(tmp_zip) as z:
-            z.extractall(staging)
-    finally:
-        tmp_zip.unlink(missing_ok=True)
+        # 两道闸门都必须在**切版本之前**跑，理由是同一个：它们查的东西每次运行的结果都一样
+        # ——不是"重跑一次可能就好"的瞬时 I/O 抖动。撞在提交点（current.txt）之后，机器就会
+        # 永久停在"新代码 + 旧出厂状态"上，而更新器此后每次开机都报「已是最新版本」、退出 0。
+        #
+        # 1) 包里的出厂母版不合格（缺 SOUL.md / 模板没占位符 / 混进了 .env）：维护者的打包
+        #    流程有 bug。这是"内容不可信/不合法"，不是"网络连不上"，响亮地抛（机器停在旧
+        #    版本是对的）。
+        # 2) 这台机器应用不了出厂状态（data/skills 是符号链接、桌面的工作台目录建不出来）：
+        #    机器状态问题，同样每次都会以相同方式失败。
+        assert_factory_complete(staging / FACTORY_DIR_REL)
+        precheck_machine_state(install_root / DATA_DIR_REL, workspace_dir)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)  # 不留几个 GB 的 staging 垃圾
+        raise
 
     final = versions_dir / new_version
     if final.exists():
@@ -396,14 +550,38 @@ def _apply_update_locked(install_root: Path, channel_url: str, pubkey_hex: str) 
         _drop_lying_previous(install_root)
         _atomic_write(install_root / CURRENT_FILE, new_version)
 
+    # 切版本已经落定（current.txt 是唯一的生效开关），现在把**新版本的出厂状态**应用到
+    # data/：config.yaml 重新渲染、SOUL.md 覆盖、出厂技能覆盖；.env / sessions /
+    # memories / 习得技能一个字节都不碰。没有这一步，新版本就只能改代码、永远改不了
+    # persona，“发行版”这个概念本身不成立（ADR-0003）。
+    #
+    # 顺序为什么是“切完再应用”、以及这里失败的话机器停在什么状态、怎么收敛，见
+    # tools/factory_state.py 的模块 docstring。结论：机器跑的是新代码 + 旧的、仍然合法的
+    # 出厂状态（能启动，只是 persona 陈旧），而 data/.factory_version 这个戳还停在旧版本
+    # ——所以**下一次运行开头的 _reconcile_factory_state 会把它补上**。收敛不依赖 Task 6
+    # 的启动器（那东西还不存在），也不依赖任何人来看 stderr。
+    apply_factory_state(install_root, new_version, workspace_dir)
     return new_version
 
 
 def main() -> None:
-    root = Path(sys.argv[1])
+    parser = argparse.ArgumentParser(description="小助手更新器")
+    parser.add_argument("install_root", type=Path, help="安装根（C:\\Users\\Public\\xiaozhushou）")
+    parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=None,
+        help="桌面的「小助手」工作台目录（默认按当前登录用户的桌面推导）",
+    )
+    args = parser.parse_args()
+
+    root = args.install_root
+    # 推导只在这里发生（见 apply_update 的 docstring）。⚠️ 桌面是**按 Windows 用户**算的，
+    # 所以“登录时更新”的计划任务必须以最终用户身份运行，不能是 SYSTEM。
+    workspace = args.workspace or default_workspace_dir()
     try:
         channel = json.loads((root / CHANNEL_FILE).read_text(encoding="utf-8"))
-        got = apply_update(root, channel["url"], channel["pubkey"])
+        got = apply_update(root, channel["url"], channel["pubkey"], workspace)
     except Exception as exc:  # 静默计划任务：不抛裸 traceback 到没人看的 stderr
         print(f"小助手更新失败：{exc}")
         raise SystemExit(1) from exc
