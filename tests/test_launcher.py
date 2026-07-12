@@ -28,6 +28,7 @@ import types
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import yaml
 
 from builder.paths import (
@@ -1123,3 +1124,102 @@ def test_an_io_error_on_the_lock_file_is_not_mistaken_for_another_launcher(tmp_p
         assert run(root, _ws(tmp_path), exe_argv=["fake"], spawn=spawn, **FAST) != 0
 
     assert calls == []  # 什么都没启动——而且**没有**报告成功
+
+
+# --------------------------------------------------------------------------
+# --init：装机时初始化 data/（把当前版本的出厂状态应用进去），然后退出，绝不启动桌面端
+#
+# 装机是有人看着的：出厂状态铺不上会**当场**暴露（安装器看见非零退出码），而不是等长辈
+# 双击图标看着没反应、再打越洋电话。--init 只做"启动前那次校对里的 apply 那一步，然后
+# 停下"——它不启动，就没有"启动即崩"可判，也就绝不许碰回滚/拉黑那套军械
+# （last_good.txt / bad_versions.txt / desktop.pid / startup_failures.txt）。
+# --------------------------------------------------------------------------
+
+
+def _must_not_spawn(argv, env):  # pragma: no cover - 跑到这里就是 bug
+    """--init 绝不启动桌面端。把它 patch 进 launcher._spawn：任何一次 spawn 都让测试炸掉。"""
+    raise AssertionError("--init 绝不该 spawn 桌面端")
+
+
+def test_init_applies_factory_state_and_never_launches(tmp_path: Path):
+    """--init 把当前版本（current.txt）的出厂状态应用到 data/：config.yaml 按模板渲染
+    （工作台路径就是 --workspace 传进来的那个）、SOUL.md/出厂技能覆盖、`.factory_version`
+    戳落盘——然后返回 0，全程一次都不 spawn。
+
+    复用的正是启动前那条一模一样的 apply 路径（factory_state.apply_factory_state），不是
+    另抄一份。"""
+    root = _root(tmp_path, "0.1.1", "0.1.0", factories=True)
+    workspace = _ws(tmp_path)
+
+    with patch.object(launcher, "_spawn", _must_not_spawn):
+        assert launcher.init(root, workspace) == 0
+
+    assert (root / "data" / "SOUL.md").read_text(encoding="utf-8") == "我是小助手 0.1.1"
+    loaded = yaml.safe_load((root / "data" / "config.yaml").read_text(encoding="utf-8"))
+    assert loaded["model"]["default"] == "0.1.1"
+    assert loaded["terminal"]["cwd"] == str(workspace)  # 用 --workspace 渲染进去了
+    assert (root / "data" / FACTORY_STAMP).read_text(encoding="utf-8").strip() == "0.1.1"
+
+
+def test_init_failure_returns_nonzero_and_leaves_the_rollback_machinery_untouched(tmp_path: Path):
+    """出厂母版铺不上时（这里：根本没有 versions/<v>/factory/，apply 会响亮地拒绝）
+    --init 返回非零、留日志——但**绝不**伪造"已收敛"的戳，也**绝不**碰回滚/拉黑那套军械。
+
+    --init 不启动，就没有"启动即崩"可判：last_good.txt / bad_versions.txt / desktop.pid /
+    startup_failures.txt 一个都不许出现，current.txt / previous.txt 一个字节都不许动。"""
+    root = _root(tmp_path, "0.1.1", "0.1.0")  # factories=False：没有出厂母版 → apply 失败
+    workspace = _ws(tmp_path)
+
+    with patch.object(launcher, "_spawn", _must_not_spawn):
+        assert launcher.init(root, workspace) != 0
+
+    assert not (root / "data" / FACTORY_STAMP).exists()  # 没有伪造"已收敛"的凭据
+    assert not (root / BAD_VERSIONS_FILE).exists()  # 没碰拉黑名单
+    assert not (root / LAST_GOOD_FILE).exists()  # 没碰回滚军械开关
+    assert not (root / STARTUP_FAILURES_FILE).exists()  # 没碰旁证账本
+    assert not (root / DESKTOP_PID_FILE).exists()
+    assert (root / "current.txt").read_text(encoding="utf-8") == "0.1.1"  # 版本指针没动
+    assert (root / "previous.txt").read_text(encoding="utf-8") == "0.1.0"
+
+
+def test_the_init_flag_applies_factory_state_then_exits_without_launching(tmp_path: Path):
+    """CLI 契约：`python -m tools.launcher <root> --init --workspace <ws>` 把出厂状态铺进
+    data/ 之后以 0 退出，绝不走启动路径（run 一次都不该被调）。装机流程用的就是这条命令。"""
+    root = _root(tmp_path, "0.1.1", "0.1.0", factories=True)
+    workspace = _ws(tmp_path)
+
+    def _must_not_run(*args, **kwargs):  # pragma: no cover - 跑到这里就是 bug
+        raise AssertionError("--init 绝不该走启动路径")
+
+    argv = ["tools.launcher", str(root), "--workspace", str(workspace), "--init"]
+    with patch.object(sys, "argv", argv), patch.object(launcher, "run", _must_not_run), \
+            patch.object(launcher, "_spawn", _must_not_spawn):
+        with pytest.raises(SystemExit) as exc:
+            launcher.main()
+
+    assert exc.value.code == 0
+    assert (root / "data" / FACTORY_STAMP).read_text(encoding="utf-8").strip() == "0.1.1"
+
+
+def test_no_init_flag_dispatches_to_the_launch_path(tmp_path: Path):
+    """CLI 契约的另一半（与 test_the_init_flag_... 对称）：不带 --init 时 main() 必须
+    走启动路径（run），绝不误入 init。把 dispatch 三元改成"总是 init"，本测试要变红。"""
+    root = _root(tmp_path, "0.1.1", "0.1.0", factories=True)
+
+    def _must_not_init(*args, **kwargs):  # pragma: no cover - 跑到这里就是 bug
+        raise AssertionError("不带 --init 绝不该走 init 路径")
+
+    seen = {}
+
+    def _fake_run(install_root, workspace=None, **kwargs):
+        seen["ran"] = True
+        return 0
+
+    argv = ["tools.launcher", str(root)]  # 无 --init
+    with patch.object(sys, "argv", argv), patch.object(launcher, "run", _fake_run), \
+            patch.object(launcher, "init", _must_not_init):
+        with pytest.raises(SystemExit) as exc:
+            launcher.main()
+
+    assert exc.value.code == 0
+    assert seen.get("ran") is True  # 确实走了启动路径

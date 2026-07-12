@@ -899,6 +899,41 @@ def _undo_rollback(install_root: Path, current: str, previous: str, log) -> None
     )
 
 
+def init(install_root: Path, workspace_dir: Path) -> int:
+    """装机时初始化 data/（HERMES_HOME）：把 current 版本的出厂状态应用进去，然后**不启动
+    桌面端**。返回 0 = 铺好了，非零 = 没铺上（装机流程当场看得见）。
+
+    为什么装机时做、而不是留给第一次启动去校对：装机是**有人看着**的。出厂状态铺不上
+    （杀软锁文件、权限、磁盘满、母版不合格）在这里会当场暴露成一个非零退出码，安装器立刻
+    看见；留给长辈第一次双击图标去撞见，他们看到的只是"双击了没反应"，然后打越洋电话。
+
+    只做启动前那次校对里的 **apply 那一步，然后停下**：复用 apply_factory_state（升级/回滚
+    /修复共用的同一条 apply 路径），不另抄一份渲染/覆盖逻辑。它对半途失败是安全的——每个
+    文件 tmp + os.replace 原子换名，`.factory_version` 戳在全部写完之后才落；铺到一半失败时
+    戳不会落下，机器不会伪造"已收敛"，下一次校对会重试。
+
+    --init **不启动**，所以它绝不碰回滚/拉黑那套军械：不写 last_good.txt / bad_versions.txt
+    / desktop.pid / startup_failures.txt，不取启动锁，不 spawn 任何东西——没有"启动即崩"
+    可判，就没有任何回滚决策。
+    """
+    log = _logger(install_root)
+    current = _read(install_root / CURRENT_FILE)
+    if not current:
+        # 不知道该初始化哪个版本（缺失、为空、或读不出来）。绝不猜（从 versions/ 里挑一个
+        # "看起来最新的"就是编造）。响亮地失败，让装机流程看见。
+        log(f"{CURRENT_FILE} 缺失、为空或读不出来——不知道该初始化哪个版本，拒绝猜")
+        return 1
+    try:
+        apply_factory_state(install_root, current, workspace_dir)
+    except (ValueError, OSError) as exc:
+        # 母版不合格（缺文件、混进了 .env）、这台机器套用不上（data/ 只读、skills 是符号
+        # 链接）、或瞬时 I/O。戳没落 = 没伪造"已收敛"；装机流程据非零退出码当场处理。
+        log(f"初始化出厂状态失败（{exc}）——data/ 未铺好，装机流程需要处理这台机器")
+        return 1
+    log(f"已把版本 {current} 的出厂状态初始化到 data/")
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="小助手启动器")
     parser.add_argument("install_root", type=Path, help="安装根（C:\\Users\\Public\\xiaozhushou）")
@@ -908,6 +943,11 @@ def main() -> None:
         default=None,
         help="桌面的「小助手」工作台目录（默认按当前登录用户的桌面推导）",
     )
+    parser.add_argument(
+        "--init",
+        action="store_true",
+        help="装机时用：把当前版本的出厂状态应用到 data/，然后退出，不启动桌面端",
+    )
     args = parser.parse_args()
 
     # 推导只在这里发生（见 run 的 docstring）。⚠️ 桌面是**按 Windows 用户**算的，所以桌面
@@ -915,7 +955,7 @@ def main() -> None:
     workspace = args.workspace or default_workspace_dir()
     log = _logger(args.install_root)
     try:
-        code = run(args.install_root, workspace)
+        code = init(args.install_root, workspace) if args.init else run(args.install_root, workspace)
     except Exception as exc:  # 面向长辈的入口：绝不把裸 traceback 抛进一个没人看的地方
         log(f"启动器自己崩了（{exc!r}）——这是 bug，需要维护者远程介入")
         raise SystemExit(1) from exc
