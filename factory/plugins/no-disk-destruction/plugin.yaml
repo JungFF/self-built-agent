@@ -1,0 +1,12 @@
+name: "no-disk-destruction"
+version: "1.0.0"
+description: >-
+  拦截 Windows 磁盘/分区级破坏命令（format 配合盘符、diskpart、PowerShell 的
+  Clear-Disk/Remove-Partition/Format-Volume、vssadmin delete shadows、
+  wbadmin delete catalog、cipher /w 安全擦除、bcdedit）。这类命令一旦被执行
+  没有任何恢复手段，因此在 terminal/execute_code 两个工具的调用前直接拒绝，
+  不弹审批确认（面向完全不懂技术的老年用户，确认弹窗形同虚设）。只覆盖磁盘级
+  破坏这一类，通用危险内容扫描由 security-guidance 插件负责。
+author: "小助手维护者"
+hooks:
+  - "pre_tool_call"

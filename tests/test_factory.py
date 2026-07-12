@@ -3,6 +3,7 @@ import ast
 from pathlib import Path
 
 import pytest
+import yaml
 
 from builder import paths
 from builder.factory import render_factory
@@ -94,6 +95,29 @@ def test_config_template_has_no_nonexistent_keys():
     tmpl = _config_tmpl()
     for bogus in ("file_access:", "learning:", "yolo:"):
         assert bogus not in tmpl
+
+
+def test_config_template_enables_the_no_disk_destruction_plugin():
+    """插件默认不加载（Hermes opt-in 设计），必须在 config.yaml.tmpl 里显式声明
+    plugins.enabled 才会真的生效——用 yaml.safe_load 解析验证，不能只做字符串包含
+    检查（字符串包含测不出缩进/嵌套写错导致 plugins.enabled 解析成别的类型，或者
+    整份 YAML 直接语法错误）。"""
+    tmpl = _config_tmpl()
+    loaded = yaml.safe_load(tmpl)
+    assert "no-disk-destruction" in loaded["plugins"]["enabled"]
+
+
+def test_render_factory_includes_the_no_disk_destruction_plugin(tmp_path: Path, skills_src: Path):
+    """插件源码放在仓库的 factory/plugins/no-disk-destruction/ 下（不是测试 fixture
+    造出来的），render_factory() 的通用 shutil.copytree 会原样带走，不需要碰它一行
+    代码。这里钉住两件事：母版里真的带上了插件文件；多出来的 plugins/ 子目录不会
+    把 assert_factory_complete 的既有校验弄挂（它只检查必需文件、禁止用户资产，
+    不限制母版里还能有什么别的东西）。"""
+    factory = render_factory(tmp_path / "out", skills_src)
+    plugin_dir = factory / "plugins" / "no-disk-destruction"
+    assert (plugin_dir / "plugin.yaml").is_file()
+    assert (plugin_dir / "__init__.py").is_file()
+    assert_factory_complete(factory)  # 不会因为多了 plugins/ 而被拒
 
 
 def test_activation_env_key_is_dashscope():

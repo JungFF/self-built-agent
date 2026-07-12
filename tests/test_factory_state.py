@@ -116,6 +116,23 @@ def test_apply_is_idempotent(world):
     assert (data / "SOUL.md").read_text(encoding="utf-8") == "我是小助手 v2"
 
 
+def test_apply_writes_plugin_files_into_data(world):
+    """插件（比如 no-disk-destruction）的源码经 restore_factory_files 的通用遍历
+    落地到 data/plugins/...——这条路径完全不需要改 restore_factory_files 一行代码
+    （它已经会把 skills/ 之外的一切原样覆盖过去，见模块 docstring）。这里钉住"母版里
+    多一个新的子目录"这件事不会被该函数漏掉或错误处理，内容必须与母版逐字一致。"""
+    root, data, workspace = world
+    plugin_dir = root / "versions" / "0.2.0" / "factory" / "plugins" / "no-disk-destruction"
+    _mk(plugin_dir / "plugin.yaml", 'name: "no-disk-destruction"\nhooks:\n  - "pre_tool_call"\n')
+    _mk(plugin_dir / "__init__.py", "def register(ctx):\n    pass\n")
+    apply_factory_state(root, "0.2.0", workspace)
+    dest = data / "plugins" / "no-disk-destruction"
+    for name in ("plugin.yaml", "__init__.py"):
+        assert (dest / name).read_text(encoding="utf-8") == (plugin_dir / name).read_text(
+            encoding="utf-8"
+        )
+
+
 def test_apply_creates_the_workspace_dir_if_the_user_deleted_it(world):
     """长辈把桌面的「小助手」文件夹删了/拖进回收站是完全可能的。config.yaml 的
     terminal.cwd 指向一个不存在的目录 = Hermes 起不来。切版本时顺手补回来。"""
