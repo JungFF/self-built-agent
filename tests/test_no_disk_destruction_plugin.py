@@ -17,6 +17,7 @@ test_release.py 那条"payload 里不许有 __pycache__"断言失败的原因。
 """
 import importlib.util
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -81,6 +82,11 @@ DANGEROUS_COMMANDS = [
     # PowerShell 反引号续行符，跟 bash 反斜杠续行符是同一类绕过手法，
     # PowerShell 又是本文件其他规则（Clear-Disk 等）本来就要覆盖的场景。
     "vssadmin `\ndelete `\nshadows /all /quiet",
+    # 冒号后的"终止形状"曾经只认 ASCII 空白（`[ \t]`），中文默认界面下
+    # 全角空格（U+3000）、不换行空格（NBSP/U+00A0）在中文输入法/中文软件
+    # 生成的文本里很常见，不需要刻意构造就可能出现，曾经因此漏检。
+    "format C:　/q",  # 全角空格（U+3000）
+    "format C: /q",  # 不换行空格 NBSP（U+00A0）
 ]
 
 
@@ -266,6 +272,46 @@ def test_execute_code_with_normal_code_passes_through(plugin):
     assert plugin._on_pre_tool_call(tool_name="execute_code", args={"code": code}) is None
 
 
+# --------------------------------------------------------- ReDoS 回归测试：同一行任意内容分支必须有长度上限
+#
+# 独立 review 实测：`_CONNECTOR` 的"同一行任意内容"分支曾经是不设上限的 `.*`。
+# 对着 `("vssadmin delete " * n) + "X"` 这种"关键词重复出现、但永远凑不出
+# "shadows" 从而永远无法完整匹配"的输入，回溯耗时随 n 呈多项式级增长——
+# n=800（约 12.8KB）实测 6~8 秒，推算 51KB 输入要 7+ 分钟。这不需要精心构造
+# 的恶意输入，LLM 生成代码进入"重复退化"这种真实失败模式就可能意外撞上，
+# 而 `pre_tool_call` 钩子同步挡在每次 `terminal`/`execute_code` 调用之前，
+# 卡死几秒到几十分钟对不懂技术的用户来说就是"软件坏了"。
+#
+# 加上 256 字符的长度上限（`.{0,256}`）后，同样的对抗输入应该在两位数毫秒内
+# 出结果——用一个远超真实阈值的时间预算（2 秒）做断言，既能在回归发生时
+# 可靠失败，也不会因为跑测试的机器一时慢一点就误报（真实耗时通常在
+# 100ms 以内，2 秒的预算留了充分余量）。
+
+
+@pytest.mark.parametrize("rule_name,repeated_unit,never_completes", [
+    # vssadmin/wbadmin 是三词规则，cipher 是两词规则——重复单元里少一个词，
+    # 但对抗输入的结构一样：不断重复"能起头却凑不齐"的前缀，最后拼一个绝不
+    # 会让规则收尾的 "X"。cipher 的连接符结构跟另两条相同，一并覆盖。
+    ("vssadmin", "vssadmin delete ", "shadows"),
+    ("wbadmin", "wbadmin delete ", "catalog"),
+    ("cipher", "cipher ", "/w"),
+])
+def test_redos_guard_polynomial_backtracking_input_stays_fast(plugin, rule_name, repeated_unit, never_completes):
+    """重复关键词但永远凑不齐完整匹配的对抗输入，不应该让正则回溯耗时随输入
+    长度失控增长。n=3200（约 51KB，对应独立 review 报告里最严重的那个规模）
+    在修复后的实测耗时是两位数毫秒，这里用 2 秒的宽松预算防止未来回归。"""
+    n = 3200
+    command = (repeated_unit * n) + "X"
+    assert never_completes not in command  # 收尾词永不出现，规则本来就凑不齐完整匹配
+
+    start = time.perf_counter()
+    result = plugin._on_pre_tool_call(tool_name="terminal", args={"command": command})
+    elapsed = time.perf_counter() - start
+
+    assert result is None  # 凑不出完整命令，本来就不该拦
+    assert elapsed < 2.0, f"{rule_name} 规则回溯耗时 {elapsed:.2f}s，疑似 ReDoS 回归（应在两位数毫秒内完成）"
+
+
 # ------------------------------------------------------------------ 只管 terminal/execute_code，不越界
 
 
@@ -284,6 +330,65 @@ def test_missing_or_malformed_args_does_not_crash(plugin):
     assert plugin._on_pre_tool_call(tool_name="terminal", args=None) is None
     assert plugin._on_pre_tool_call(tool_name="terminal", args={}) is None
     assert plugin._on_pre_tool_call() is None
+
+
+# =================================================== 已知限制（KNOWN LIMITATION）回归测试
+#
+# 下面几条测试断言的是"当前的实际行为"，不是"期望的行为"——都是 review
+# 发现、维护者判断为可以维持现状不修的取舍（漏报或误伤都有；前三条是本轮
+# 修复之前就存在的残留问题，第四条是本轮 ReDoS 修复本身引入、经权衡后接受
+# 的代价），没有配套测试锁定的话，容易被以后的改动无意间加重，或者被人
+# 误以为是 bug 顺手"修复"掉而没人注意到这其实是权衡后的既有决策。测试名统一带
+# `test_known_limitation_` 前缀，docstring 里明确写"这是已知限制，不是要求
+# 修复的目标"，看到失败时不要直接改代码让它变绿，先确认是不是这条限制本身
+# 被有意收紧/放宽了。
+
+
+def test_known_limitation_vssadmin_comma_enumeration_prose_is_false_positive(plugin):
+    """已知限制（不要求修复）：`vssadmin`/`delete`/`shadows` 顺序出现在一句
+    自然语言散文里（不是真实命令），也会被误判拦截。这是"同一行内任意内容"
+    连接方式本身固有的精度局限——`_CONNECTOR` 无法区分"这是被标点隔开的
+    真实命令参数"还是"这只是一句提到这几个词的解释性文字"。维护者判断为
+    可以接受的取舍（优先不漏报真实破坏命令），这条测试只是记录现状。"""
+    command = "vssadmin, delete, shadows are three related concepts"
+    result = plugin._on_pre_tool_call(tool_name="terminal", args={"command": command})
+    assert result is not None and result["action"] == "block"  # 现状：会被误伤
+
+
+def test_known_limitation_cipher_explanatory_prose_is_false_positive(plugin):
+    """已知限制（不要求修复）：一段解释"cipher /w"这个命令语法本身的说明性
+    文字（比如教程/文档/agent 转述），只要字面上原样出现了"cipher"和"/w"，
+    也会被判定为命中——规则本身就是按字面语法形状匹配，不理解"这是在引用
+    命令语法"还是"这是在真的执行它"。记录现状，不要求修复。"""
+    command = (
+        "This paragraph is unrelated to Windows EFS cipher /w secure erase; "
+        "it is just explanatory text about what that command syntax means."
+    )
+    result = plugin._on_pre_tool_call(tool_name="terminal", args={"command": command})
+    assert result is not None and result["action"] == "block"  # 现状：会被误伤
+
+
+def test_known_limitation_caret_line_continuation_bypasses_vssadmin_rule(plugin):
+    """已知限制（不要求修复）：cmd.exe 批处理脚本用 `^` 续行符换行，
+    `_LINE_SPLIT_GLUE` 的胶水字符类没有包含 `^`，所以这种跨行拆分方式目前
+    不会被拦——是真实存在的绕过手法，但维护者判断这次不在范围内，留给
+    以后的任务处理。这条测试记录现状（漏报），不代表这是期望行为。"""
+    command = "vssadmin ^\ndelete ^\nshadows /all /quiet"
+    result = plugin._on_pre_tool_call(tool_name="terminal", args={"command": command})
+    assert result is None  # 现状：会漏过
+
+
+def test_known_limitation_long_same_line_padding_bypasses_connector_bound(plugin):
+    """已知限制（不要求修复，本轮 ReDoS 修复本身带来的、经权衡后接受的代价）：
+    `_CONNECTOR` 的同一行分支从无界 `.*` 收紧成 `.{0,256}` 后，如果关键词
+    之间塞了超过约 256 个任意字符的填充物，会因为超出长度上限、又不是
+    "跨行胶水字符"而匹配失败——旧的无界版本会不管填充多长都命中。这是
+    修掉灾难性回溯必须付出的代价（无法同时做到"完全不限长度"和"不会
+    在对抗输入上回溯爆炸"），真实的 vssadmin 命令语法里两个关键词间从不会
+    隔这么远，记录现状，不代表这是需要堵上的漏洞。"""
+    command = "vssadmin " + ("A" * 300) + " delete shadows"
+    result = plugin._on_pre_tool_call(tool_name="terminal", args={"command": command})
+    assert result is None  # 现状：填充物太长会漏过（收紧长度上限前会命中）
 
 
 # ------------------------------------------------------------------ register(ctx)
