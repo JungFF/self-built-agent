@@ -79,6 +79,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from builder.paths import (
+    AGENT_BROWSER_EXECUTABLE_ENV,
     BAD_VERSIONS_FILE,
     CURRENT_FILE,
     DATA_DIR_REL,
@@ -162,6 +163,31 @@ def default_exe_argv(install_root: Path, version: str) -> list[str]:
     return [str(vdir / ELECTRON_EXE_REL), str(vdir / DESKTOP_APP_REL)]
 
 
+def _find_bundled_chromium(playwright_dir: Path) -> Path | None:
+    """在这个版本自带的 ms-playwright\\ 目录下找已经打包好的 Chromium 可执行文件。
+
+    2026-07-20 真机验证过：Hermes 的网页浏览工具（第三方库 agent-browser，跟 Hermes 本体、
+    跟我们的打包流程都无关）首次被用到时，默认会联网找 Google 的 "Chrome for Testing"
+    服务器下载一份**独立的** Chrome——这是一个我们没打包进离线快照的联网依赖，爸妈在大陆，
+    这个请求大概率连不上或很慢。但 agent-browser 支持 AGENT_BROWSER_EXECUTABLE_PATH 指向
+    一个已有的可执行文件、直接复用，不再联网下载——我们已经打包了一份 Playwright Chromium。
+
+    Playwright 的浏览器缓存布局按 ``chromium-<build 号>`` 建子目录，build 号随 Playwright
+    版本变化、不能硬编码，所以这里用通配符找；找不到就返回 None——调用方据此决定是否导出
+    这个环境变量（不设它的后果只是 agent-browser 退回自己的联网安装逻辑，不是启动失败，
+    找不到不该响亮报错、更不该挡住桌面端启动）。
+    """
+    for pattern in (
+        "chromium-*/chrome-win/chrome.exe",
+        "chromium-*/chrome-linux/chrome",
+        "chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+    ):
+        matches = sorted(playwright_dir.glob(pattern))
+        if matches:
+            return matches[0]
+    return None
+
+
 def _child_env(install_root: Path, version: str) -> dict[str, str]:
     """桌面端进程的环境变量。
 
@@ -170,10 +196,16 @@ def _child_env(install_root: Path, version: str) -> dict[str, str]:
     长辈看到的是"我的东西都不见了"，维护者收不到任何信号。PLAYWRIGHT_BROWSERS_PATH 同理
     （spike 实测它是浏览器落点的唯一控制项），而且它是**按版本**的：回滚之后必须指向旧版本
     自己的 ms-playwright，不能还指着那个刚被拉黑的版本目录（下次更新它就被剪掉了）。
+
+    AGENT_BROWSER_EXECUTABLE_ENV 同样按版本：见 _find_bundled_chromium。
     """
     env = os.environ.copy()
     env[HERMES_HOME_ENV] = str(install_root / DATA_DIR_REL)
-    env[PLAYWRIGHT_ENV] = str(_version_dir(install_root, version) / PLAYWRIGHT_DIR_REL)
+    playwright_dir = _version_dir(install_root, version) / PLAYWRIGHT_DIR_REL
+    env[PLAYWRIGHT_ENV] = str(playwright_dir)
+    chromium = _find_bundled_chromium(playwright_dir)
+    if chromium is not None:
+        env[AGENT_BROWSER_EXECUTABLE_ENV] = str(chromium)
     return env
 
 

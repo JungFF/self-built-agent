@@ -157,6 +157,7 @@ def assemble_payload(snapshot_root: Path, skills_src: Path, dest: Path) -> Path:
         )
 
     shutil.copytree(snapshot_root, dest, symlinks=True, dirs_exist_ok=True)
+    _clean_git_worktree(dest / rel_path(AGENT_DIR_REL))
     render_factory(dest, skills_src)  # 出厂母版（它自己会跑一遍消费方的闸门）
 
     tools_dst = dest / TOOLS_DIR_REL
@@ -172,6 +173,36 @@ def assemble_payload(snapshot_root: Path, skills_src: Path, dest: Path) -> Path:
     for name in _SHIPPED_BUILDER:
         shutil.copy2(REPO_ROOT / BUILDER_DIR_REL / name, builder_dst / name)
     return dest
+
+
+def _clean_git_worktree(agent_dir: Path) -> None:
+    """真机 2026-07-20 复现过的故障：装配机上 `git checkout` 之后，hermes-agent 仓库里一批
+    文本文件在 git 眼里"被改动"——内容跟 HEAD 逐字节等价（`git diff --ignore-all-space` 验证
+    过是空的，换行符是头号嫌疑），但 git 不知道。这份脏工作区如果原样打进包，机器首次启动时
+    Hermes 自己的 bootstrap 会跑 `git checkout <钉死的 commit>`——git 见工作区有本地修改，为了
+    不丢数据直接 Aborting（退出码 1），桌面端弹"Hermes couldn't start"。跟能不能连网无关：装配机
+    上就地复现过。装配时把它强制清成跟 HEAD 一致，机器上那次 checkout 才能保证拿到干净仓库。
+
+    `git checkout -f -- .` 只还原**已跟踪文件**的改动——不清除未跟踪文件（`git clean`
+    的地盘），也不递归子模块。对这里要治的病（一个已经在钉死 commit 上的仓库，被跟踪文件
+    的换行符漂移搞脏）这个范围是够的：未跟踪文件不会触发"local changes would be
+    overwritten by checkout"这个 abort。hermes-agent 目前没有子模块，如果将来有，这里
+    需要重新评估。
+    """
+    if not (agent_dir / ".git").exists():
+        return  # 不是 git 仓库（测试快照、或者 Hermes 未来换分发方式）——无需清理
+    result = subprocess.run(  # noqa: S603 - 参数是常量，解释器是当前这个
+        ["git", "checkout", "-f", "--", "."],
+        cwd=agent_dir,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise ValueError(
+            f"清理 {agent_dir} 的 git 工作区失败（exit {result.returncode}）："
+            f"{result.stderr.strip()}——这份脏工作区如果原样打包，机器首次启动时 Hermes 自己的 "
+            "bootstrap 跑 git checkout 会当场 Aborting。未产出任何东西。"
+        )
 
 
 # =============================================================================

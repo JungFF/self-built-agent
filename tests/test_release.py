@@ -25,6 +25,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from cryptography.exceptions import InvalidSignature
 from builder import keys, release
 from builder.keys import generate_keypair, public_key_hex, sign
 from builder.paths import (
+    AGENT_DIR_REL,
     BASE_PYTHON_REL,
     BUILDER_DIR_REL,
     DESKTOP_APP_REL,
@@ -765,4 +767,64 @@ def test_assemble_payload_refuses_to_ship_an_incomplete_tool_layer(
     (fake_repo / "tools" / "updater.py").write_text("", encoding="utf-8")  # 只剩一个
     monkeypatch.setattr("builder.release.REPO_ROOT", fake_repo)
     with pytest.raises(ValueError, match="launcher.py"):
+        assemble_payload(snapshot, skills_src, tmp_path / "payload")
+
+
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, check=True
+    )
+
+
+def test_assemble_payload_cleans_a_dirty_hermes_agent_git_worktree(
+    tmp_path: Path, snapshot, skills_src
+):
+    """真机 2026-07-20 复现过的故障：装配机上 `git checkout` 之后，一批文本文件在 git
+    眼里"被改动"——即使内容跟 HEAD 逐字节等价（用 `git diff --ignore-all-space` 验证过：
+    忽略空白后的 diff 是空的，Windows 上的换行符处理是头号嫌疑）。这份脏工作区如果被
+    原样打进包，机器首次启动时 Hermes 自己的 bootstrap 会跑 `git checkout <钉死的
+    commit>`——git 一看工作区有本地修改，为了不丢数据直接 Aborting，退出码 1，桌面端
+    弹 "Hermes couldn't start"。跟国内网络能不能连没有任何关系：硅谷这台装配机今天就
+    复现过一次，靠真人在故障机上手动 `git checkout -f` 才绕过去。
+
+    assemble_payload 必须在装配时就把 hermes-agent 的 git 工作区强制清成跟 HEAD 一致
+    ——这样机器上 Hermes 自己那次 checkout 永远拿到一个干净的仓库，不管装配机在打包过程中
+    是怎么把它弄脏的。"""
+    agent_dir = snapshot / rel_path(AGENT_DIR_REL)
+    tracked = agent_dir / "tools" / "skills_guard.py"
+    tracked.parent.mkdir(parents=True, exist_ok=True)
+    tracked.write_text("print('committed')\n", encoding="utf-8")
+    _git(agent_dir, "init", "-q")
+    _git(agent_dir, "config", "user.email", "test@example.com")
+    _git(agent_dir, "config", "user.name", "test")
+    _git(agent_dir, "add", "-A")
+    _git(agent_dir, "commit", "-q", "-m", "initial")
+    # 模拟装配机上真实发生的事：工作区被改动过、从未提交。
+    tracked.write_text("print('modified on disk, never committed')\n", encoding="utf-8")
+    assert _git(agent_dir, "status", "--porcelain").stdout.strip() != ""  # 前置条件：真的脏了
+
+    dest = assemble_payload(snapshot, skills_src, tmp_path / "payload")
+
+    status = _git(dest / rel_path(AGENT_DIR_REL), "status", "--porcelain")
+    assert status.stdout.strip() == ""  # payload 里的仓库必须干净
+
+
+def test_assemble_payload_tolerates_a_snapshot_with_no_git_repo(
+    tmp_path: Path, snapshot, skills_src
+):
+    """快照里的 hermes-agent 不一定是 git 仓库（测试用的假快照、或者 Hermes 未来换成
+    别的分发方式）。这道修复是"锦上添花"，不该在这种情况下把装配本身搞炸。"""
+    dest = assemble_payload(snapshot, skills_src, tmp_path / "payload")
+    assert (dest / rel_path(AGENT_DIR_REL)).is_dir()
+
+
+def test_assemble_payload_refuses_a_hermes_agent_whose_git_repo_is_unusable(
+    tmp_path: Path, snapshot, skills_src
+):
+    """这个模块几乎全是守卫，每条守卫都该有一条证明它真的会炸的测试——`_clean_git_worktree`
+    也不例外：`.git` 存在但不是一个能用的仓库（比如装配机上被半途中断的一次 git 操作留下的
+    残局）时，`git checkout -f` 本身会失败，必须响亮地炸掉，而不是把这个坏仓库悄悄打进包。"""
+    agent_dir = snapshot / rel_path(AGENT_DIR_REL)
+    (agent_dir / ".git").mkdir()  # 一个空目录，不是能用的 git 仓库
+    with pytest.raises(ValueError, match="清理.*git 工作区失败"):
         assemble_payload(snapshot, skills_src, tmp_path / "payload")

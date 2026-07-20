@@ -278,6 +278,18 @@ USER_OWNED = (ENV_FILE, "sessions", "memories", LOGS_DIR)
 HERMES_HOME_ENV = "HERMES_HOME"                    # → <root>\data
 PLAYWRIGHT_ENV = "PLAYWRIGHT_BROWSERS_PATH"        # → <root>\versions\<cur>\ms-playwright
 
+# Hermes 的网页浏览工具（第三方开源库 agent-browser，vercel-labs 发布，跟 Hermes 本体、
+# 跟我们的打包流程都无关）首次被用到时，默认会联网找 Google 的 "Chrome for Testing" 服务器
+# 下载一份**独立的** Chrome——这是一个我们没预料到、也没打包进离线快照的联网依赖（爸妈在
+# 大陆，Google 的服务器大概率连不上或很慢）。2026-07-20 真机验证过：不设这个环境变量时，
+# agent-browser 首次用会先跑一次联网安装（实测约 18 秒，硅谷 ECS 上能成，无法代表大陆网络）。
+#
+# 但 agent-browser 自己的文档写明会自动探测「已有的 Chrome / Brave / Playwright / Puppeteer
+# 安装」，并提供 AGENT_BROWSER_EXECUTABLE_PATH 这个环境变量可以显式指给它一个可执行文件——
+# 指向我们已经打包进版本目录的那份 Playwright Chromium（PLAYWRIGHT_ENV 指的那个目录下）,
+# 它就会直接复用，不再联网下载。
+AGENT_BROWSER_EXECUTABLE_ENV = "AGENT_BROWSER_EXECUTABLE_PATH"
+
 # ---- 工作台 ----
 WORKSPACE_DIRNAME = "小助手"            # 桌面上的工作台文件夹名
 

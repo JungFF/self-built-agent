@@ -32,6 +32,7 @@ import pytest
 import yaml
 
 from builder.paths import (
+    AGENT_BROWSER_EXECUTABLE_ENV,
     BAD_VERSIONS_FILE,
     DESKTOP_APP_REL,
     DESKTOP_PID_FILE,
@@ -40,6 +41,7 @@ from builder.paths import (
     HERMES_HOME_ENV,
     LAST_GOOD_FILE,
     LAUNCH_LOCK_FILE,
+    PLAYWRIGHT_DIR_REL,
     PLAYWRIGHT_ENV,
     STARTUP_FAILURES_FILE,
     WORKSPACE_DIRNAME,
@@ -244,6 +246,94 @@ def test_hermes_home_and_playwright_are_exported_to_the_real_child(tmp_path: Pat
     hermes_home, playwright = seen.read_text(encoding="utf-8").splitlines()
     assert Path(hermes_home) == root / "data"
     assert Path(playwright) == root / "versions" / "0.1.1" / "ms-playwright"
+
+
+def test_agent_browser_is_pointed_at_the_bundled_chromium(tmp_path: Path):
+    """Hermes 的网页浏览工具（第三方库 agent-browser）首次用到时，默认会联网找 Google
+    的 "Chrome for Testing" 服务器下载一份独立的 Chrome——爸妈在大陆，这个联网请求大概率
+    连不上或很慢，而且这跟"离线全量打包"的设计目标直接冲突。
+
+    agent-browser 自己支持 AGENT_BROWSER_EXECUTABLE_PATH 指向一个已有的可执行文件、
+    直接复用，不再联网下载。我们已经打包了一份 Playwright Chromium（ms-playwright\\），
+    所以启动器应该找到它、把这个环境变量导出给桌面端。
+
+    真机上 2026-07-20 验证过：不设这个变量时，agent-browser 首次使用会先跑一次联网安装。
+    """
+    root = _root(tmp_path, "0.1.1", "0.1.0")
+    chromium = (
+        root / "versions" / "0.1.1" / PLAYWRIGHT_DIR_REL
+        / "chromium-1234" / "chrome-win" / "chrome.exe"
+    )
+    chromium.parent.mkdir(parents=True)
+    chromium.write_bytes(b"MZ fake chromium")
+
+    seen = tmp_path / "child-env.txt"
+    child = [
+        sys.executable,
+        "-c",
+        "import os,sys,time;"
+        "open(sys.argv[1],'w',encoding='utf-8').write("
+        f"os.environ.get({AGENT_BROWSER_EXECUTABLE_ENV!r},'<未设置>'));"
+        "time.sleep(60)",
+        str(seen),
+    ]
+
+    spawned = []
+
+    def spy(argv, env):
+        proc = launcher._spawn(argv, env)
+        spawned.append(proc)
+        return proc
+
+    try:
+        assert (
+            run(root, _ws(tmp_path), exe_argv=child, spawn=spy, health_seconds=1.5,
+                startup_seconds=0.2)
+            == 0
+        )
+    finally:
+        for proc in spawned:
+            proc.kill()
+            proc.wait()
+
+    assert Path(seen.read_text(encoding="utf-8")) == chromium
+
+
+def test_agent_browser_env_is_left_unset_when_no_bundled_chromium_is_found(tmp_path: Path):
+    """打包漏掉了 ms-playwright\\（或者它是空的）时，不能让启动器崩掉——桌面端照样要
+    起来，只是 agent-browser 会退回它自己的联网安装逻辑（不是这里要解决的故障）。"""
+    root = _root(tmp_path, "0.1.1", "0.1.0")  # 没有 ms-playwright\\ 目录
+
+    seen = tmp_path / "child-env.txt"
+    child = [
+        sys.executable,
+        "-c",
+        "import os,sys,time;"
+        "open(sys.argv[1],'w',encoding='utf-8').write("
+        f"os.environ.get({AGENT_BROWSER_EXECUTABLE_ENV!r},'<未设置>'));"
+        "time.sleep(60)",
+        str(seen),
+    ]
+
+    spawned = []
+
+    def spy(argv, env):
+        proc = launcher._spawn(argv, env)
+        spawned.append(proc)
+        return proc
+
+    try:
+        assert (
+            run(root, _ws(tmp_path), exe_argv=child, spawn=spy, health_seconds=1.5,
+                startup_seconds=0.2)
+            == 0
+        )
+    finally:
+        for proc in spawned:
+            proc.kill()
+            proc.wait()
+
+    assert seen.read_text(encoding="utf-8") == "<未设置>"
 
 
 # --------------------------------------------------------------------------
