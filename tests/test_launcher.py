@@ -299,6 +299,56 @@ def test_agent_browser_is_pointed_at_the_bundled_chromium(tmp_path: Path):
     assert Path(seen.read_text(encoding="utf-8")) == chromium
 
 
+def test_agent_browser_is_pointed_at_the_bundled_chromium_on_chrome_win64_layout(
+    tmp_path: Path,
+):
+    """真机 2026-07-21 复现过的故障：真实 Playwright 在 Windows 上装出来的目录叫
+    `chrome-win64`，不是 `chrome-win`——`_find_bundled_chromium` 的通配符只写了后者，
+    实测 glob 匹配数是 0。这个失败按设计是静默的（找不到就退回联网下载，不报错、不挡
+    桌面端启动），所以上一轮真机验证完全没暴露：桌面端照常起来，只是每次网页搜索都会
+    先卡住联网下载一次 Chrome for Testing。这条测试专门钉住 chrome-win64 这个真实布局，
+    不能只靠 test_agent_browser_is_pointed_at_the_bundled_chromium 那条（它用的目录名
+    `chrome-win` 凑巧就是实现里那个写错的名字，红不了）。"""
+    root = _root(tmp_path, "0.1.1", "0.1.0")
+    chromium = (
+        root / "versions" / "0.1.1" / PLAYWRIGHT_DIR_REL
+        / "chromium-1228" / "chrome-win64" / "chrome.exe"
+    )
+    chromium.parent.mkdir(parents=True)
+    chromium.write_bytes(b"MZ fake chromium")
+
+    seen = tmp_path / "child-env.txt"
+    child = [
+        sys.executable,
+        "-c",
+        "import os,sys,time;"
+        "open(sys.argv[1],'w',encoding='utf-8').write("
+        f"os.environ.get({AGENT_BROWSER_EXECUTABLE_ENV!r},'<未设置>'));"
+        "time.sleep(60)",
+        str(seen),
+    ]
+
+    spawned = []
+
+    def spy(argv, env):
+        proc = launcher._spawn(argv, env)
+        spawned.append(proc)
+        return proc
+
+    try:
+        assert (
+            run(root, _ws(tmp_path), exe_argv=child, spawn=spy, health_seconds=1.5,
+                startup_seconds=0.2)
+            == 0
+        )
+    finally:
+        for proc in spawned:
+            proc.kill()
+            proc.wait()
+
+    assert Path(seen.read_text(encoding="utf-8")) == chromium
+
+
 def test_agent_browser_env_is_left_unset_when_no_bundled_chromium_is_found(tmp_path: Path):
     """打包漏掉了 ms-playwright\\（或者它是空的）时，不能让启动器崩掉——桌面端照样要
     起来，只是 agent-browser 会退回它自己的联网安装逻辑（不是这里要解决的故障）。"""

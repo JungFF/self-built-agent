@@ -42,6 +42,10 @@ SolidCompression=yes
 WizardStyle=modern
 
 [Languages]
+; Inno Setup 官方发行版不带简体中文（属于 unofficial 翻译），装配机第一次编译前得手动放进
+; ISCC 的 Languages\ 目录，否则编译在这一行直接 abort（真机 2026-07-21 撞过一次）：
+;   https://raw.githubusercontent.com/jrsoftware/issrc/is-6_7_3/Files/Languages/Unofficial/ChineseSimplified.isl
+; tag 换成装配机上实际装的 Inno Setup 版本对应的那个（is-6_7_3 对应 6.7.3）。
 Name: "chs"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 
 [Files]
@@ -78,6 +82,12 @@ Filename: "schtasks"; \
   Parameters: "/Create /F /SC ONLOGON /TN ""小助手更新"" /TR ""\""{#InstallRoot}\小助手更新.cmd\"""""; \
   Flags: runhidden; \
   StatusMsg: "正在设置自动更新……"
+
+[UninstallRun]
+; 真机 2026-07-21 实测过：卸载后这个计划任务会残留——每次登录都触发一次，指向的
+; 小助手更新.cmd 已经被卸载删掉，静默失败，长辈和维护者都看不见。[Run] 段建的东西
+; Inno 不会自动帮你卸，得在这里显式删掉。
+Filename: "schtasks"; Parameters: "/Delete /F /TN ""小助手更新"""; Flags: runhidden
 
 [Code]
 var

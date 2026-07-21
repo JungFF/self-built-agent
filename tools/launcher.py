@@ -178,7 +178,8 @@ def _find_bundled_chromium(playwright_dir: Path) -> Path | None:
     找不到不该响亮报错、更不该挡住桌面端启动）。
     """
     for pattern in (
-        "chromium-*/chrome-win/chrome.exe",
+        "chromium-*/chrome-win64/chrome.exe",  # 真机 2026-07-21 验证过：现在的 Playwright 版本用这个
+        "chromium-*/chrome-win/chrome.exe",  # 保留：旧 Playwright build 用过这个名字，回滚旧版本时还需要
         "chromium-*/chrome-linux/chrome",
         "chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium",
     ):

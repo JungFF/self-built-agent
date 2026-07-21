@@ -74,6 +74,7 @@ from builder.paths import (
     HEARTBEAT_CRED_FIELDS,
     HEARTBEAT_CRED_FILE,
     HEARTBEAT_PREFIX,
+    INSTALL_ROOT,
     PLAYWRIGHT_DIR_REL,
     TOOLS_DIR_REL,
     VENV_PYTHON_REL,
@@ -141,11 +142,15 @@ def package_name(version: str) -> str:
 # =============================================================================
 
 
-def assemble_payload(snapshot_root: Path, skills_src: Path, dest: Path) -> Path:
+def assemble_payload(snapshot_root: Path, skills_src: Path, dest: Path, version: str) -> Path:
     """把装配机上的快照装配成一棵完整的 payload，返回它。
 
     skills_src 是**必传的**：出厂技能母版只能来自装配机上装好的 Hermes（`skills/`），
     仓库里一个出厂技能都没有（见 builder/factory.render_factory）。
+
+    version 是**这次装配的目标版本号**——不是快照自己以为的版本号。快照里的 venv 可能是
+    从另一个版本借来的（见 _rewrite_venv_home），必须显式告诉装配器"这次装的是哪个版本"，
+    不能信快照自带的任何路径。
     """
     snapshot_root, dest = Path(snapshot_root), Path(dest)
     _assert_has(snapshot_root, _SNAPSHOT_REQUIRED, "快照")
@@ -157,7 +162,9 @@ def assemble_payload(snapshot_root: Path, skills_src: Path, dest: Path) -> Path:
         )
 
     shutil.copytree(snapshot_root, dest, symlinks=True, dirs_exist_ok=True)
-    _clean_git_worktree(dest / rel_path(AGENT_DIR_REL))
+    agent_dir = dest / rel_path(AGENT_DIR_REL)
+    _clean_git_worktree(agent_dir)
+    _rewrite_venv_home(agent_dir, version)
     render_factory(dest, skills_src)  # 出厂母版（它自己会跑一遍消费方的闸门）
 
     tools_dst = dest / TOOLS_DIR_REL
@@ -203,6 +210,37 @@ def _clean_git_worktree(agent_dir: Path) -> None:
             f"{result.stderr.strip()}——这份脏工作区如果原样打包，机器首次启动时 Hermes 自己的 "
             "bootstrap 跑 git checkout 会当场 Aborting。未产出任何东西。"
         )
+
+
+def _rewrite_venv_home(agent_dir: Path, version: str) -> None:
+    """真机 2026-07-21 复现过的故障：`hermes-agent\\venv\\pyvenv.cfg` 里的 `home` 是**创建
+    这个 venv 时**烧下的绝对路径（比如 `...\\versions\\0.1.0\\python-base`）。快照如果是从
+    另一个版本借来的（省得重新走一遍 Windows Native 安装），这个路径就跟这次真正要装配的
+    版本号对不上；全新机器上根本没有那个旧版本目录，Python 解释器启动时找不到 stdlib，
+    直接 `ModuleNotFoundError: No module named 'encodings'`——比 Hermes 自己的 bootstrap
+    还早，装机流程在 `launcher --init` 那一步就以错误码 1 崩溃，装出一个只有 `.env` 的空壳。
+
+    不能信快照自带的那份路径是对的，必须显式重写成**这次装配的目标版本号**对应的路径。
+    """
+    cfg_path = agent_dir / "venv" / "pyvenv.cfg"
+    if not cfg_path.is_file():
+        return  # 没有真的 venv（测试快照，或者 Hermes 未来换 Python 打包方式）——无需改
+    base_python_dir = BASE_PYTHON_REL.rsplit("\\", 1)[0]  # "python-base"
+    new_home = f"home = {INSTALL_ROOT}\\versions\\{version}\\{base_python_dir}"
+    lines = cfg_path.read_text(encoding="utf-8").splitlines()
+
+    def is_home_line(line: str) -> bool:
+        return line.split("=", 1)[0].strip() == "home"
+
+    # 显式判断有没有 home 行——不能用"重写后内容有没有变"来推断：同版本装配（home 本来就
+    # 已经指对了目标版本）时内容一字不差，那不是"没有 home 行"，而是"已经对了"，照样得放行。
+    if not any(is_home_line(ln) for ln in lines):
+        raise ValueError(
+            f"{cfg_path} 里没有 home = 这一行——不是一个正常的 venv pyvenv.cfg，装出来的 "
+            "Python 解释器大概率起不来。未产出任何东西。"
+        )
+    rewritten = [new_home if is_home_line(ln) else ln for ln in lines]
+    cfg_path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
 
 
 # =============================================================================
@@ -739,7 +777,7 @@ def main() -> None:
     payload = args.payload
     if payload is None:
         payload = args.payload_dir or args.out.parent / f"payload-{args.version}"
-        assemble_payload(args.snapshot, args.skills, payload)
+        assemble_payload(args.snapshot, args.skills, payload, args.version)
 
     built = build_release(
         payload,

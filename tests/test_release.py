@@ -46,6 +46,7 @@ from builder.paths import (
     FACTORY_STAMP,
     HEARTBEAT_CRED_FILE,
     HEARTBEAT_PREFIX,
+    INSTALL_ROOT,
     PLAYWRIGHT_DIR_REL,
     TOOLS_DIR_REL,
     VENV_PYTHON_REL,
@@ -99,8 +100,9 @@ def snapshot(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def payload(tmp_path: Path, snapshot: Path, skills_src: Path) -> Path:
-    """一棵装配好的、合格的 payload（= versions/<版本号>/ 的内容）。"""
-    return assemble_payload(snapshot, skills_src, tmp_path / "payload")
+    """一棵装配好的、合格的 payload（= versions/<版本号>/ 的内容）。版本号跟 _build() 的
+    默认值（"0.1.0"）保持一致——两者本该是同一个数，只是分属两个不同的调用方。"""
+    return assemble_payload(snapshot, skills_src, tmp_path / "payload", "0.1.0")
 
 
 @pytest.fixture()
@@ -744,7 +746,7 @@ def test_assemble_payload_refuses_a_dirty_destination(tmp_path: Path, snapshot, 
     dest.mkdir()
     (dest / "leftover.txt").write_text("上一次的残留", encoding="utf-8")
     with pytest.raises(ValueError):
-        assemble_payload(snapshot, skills_src, dest)
+        assemble_payload(snapshot, skills_src, dest, "0.1.0")
 
 
 def test_assemble_payload_refuses_a_snapshot_that_is_missing_the_desktop_app(
@@ -752,7 +754,7 @@ def test_assemble_payload_refuses_a_snapshot_that_is_missing_the_desktop_app(
 ):
     (snapshot / rel_path(ELECTRON_EXE_REL)).unlink()
     with pytest.raises(ValueError, match="缺"):
-        assemble_payload(snapshot, skills_src, tmp_path / "payload")
+        assemble_payload(snapshot, skills_src, tmp_path / "payload", "0.1.0")
 
 
 def test_assemble_payload_refuses_to_ship_an_incomplete_tool_layer(
@@ -767,7 +769,7 @@ def test_assemble_payload_refuses_to_ship_an_incomplete_tool_layer(
     (fake_repo / "tools" / "updater.py").write_text("", encoding="utf-8")  # 只剩一个
     monkeypatch.setattr("builder.release.REPO_ROOT", fake_repo)
     with pytest.raises(ValueError, match="launcher.py"):
-        assemble_payload(snapshot, skills_src, tmp_path / "payload")
+        assemble_payload(snapshot, skills_src, tmp_path / "payload", "0.1.0")
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
@@ -803,7 +805,7 @@ def test_assemble_payload_cleans_a_dirty_hermes_agent_git_worktree(
     tracked.write_text("print('modified on disk, never committed')\n", encoding="utf-8")
     assert _git(agent_dir, "status", "--porcelain").stdout.strip() != ""  # 前置条件：真的脏了
 
-    dest = assemble_payload(snapshot, skills_src, tmp_path / "payload")
+    dest = assemble_payload(snapshot, skills_src, tmp_path / "payload", "0.1.0")
 
     status = _git(dest / rel_path(AGENT_DIR_REL), "status", "--porcelain")
     assert status.stdout.strip() == ""  # payload 里的仓库必须干净
@@ -814,7 +816,7 @@ def test_assemble_payload_tolerates_a_snapshot_with_no_git_repo(
 ):
     """快照里的 hermes-agent 不一定是 git 仓库（测试用的假快照、或者 Hermes 未来换成
     别的分发方式）。这道修复是"锦上添花"，不该在这种情况下把装配本身搞炸。"""
-    dest = assemble_payload(snapshot, skills_src, tmp_path / "payload")
+    dest = assemble_payload(snapshot, skills_src, tmp_path / "payload", "0.1.0")
     assert (dest / rel_path(AGENT_DIR_REL)).is_dir()
 
 
@@ -827,4 +829,79 @@ def test_assemble_payload_refuses_a_hermes_agent_whose_git_repo_is_unusable(
     agent_dir = snapshot / rel_path(AGENT_DIR_REL)
     (agent_dir / ".git").mkdir()  # 一个空目录，不是能用的 git 仓库
     with pytest.raises(ValueError, match="清理.*git 工作区失败"):
-        assemble_payload(snapshot, skills_src, tmp_path / "payload")
+        assemble_payload(snapshot, skills_src, tmp_path / "payload", "0.1.0")
+
+
+def _pyvenv_cfg_path(snapshot: Path) -> Path:
+    return (snapshot / rel_path(VENV_PYTHON_REL)).parent.parent / "pyvenv.cfg"
+
+
+def test_assemble_payload_rewrites_the_venv_home_to_the_target_version(
+    tmp_path: Path, snapshot, skills_src
+):
+    """真机 2026-07-21 复现过的故障：这次装 0.1.2 时复用了 0.1.0 快照里现成的 venv（省得
+    重新走一遍 Windows Native 安装），但 venv 的 `pyvenv.cfg` 是**创建时**烧下的绝对路径
+    ——`home` 那一行原样写着 `...\\versions\\0.1.0\\python-base`。全新机器上根本没有
+    `versions\\0.1.0\\` 这个目录，Python 解释器启动时找不到 stdlib，直接
+    `ModuleNotFoundError: No module named 'encodings'`——比 Hermes 自己的 bootstrap 还早，
+    装机流程走到 `launcher --init` 那一步就以错误码 1 崩溃，装出一个只有 `.env` 的空壳。
+
+    assemble_payload 必须在装配时把 `home` 重写成**这次装配的目标版本号**对应的路径，
+    不能相信快照自带的那份是对的——快照本来就可能是从别的版本借来的。"""
+    base_python_dir = BASE_PYTHON_REL.rsplit("\\", 1)[0]  # "python-base"
+    cfg = _pyvenv_cfg_path(snapshot)
+    cfg.write_text(
+        "home = " + INSTALL_ROOT + "\\versions\\0.1.0\\" + base_python_dir + "\n"
+        "implementation = CPython\n"
+        "uv = 0.11.28\n"
+        "version_info = 3.11\n"
+        "include-system-site-packages = false\n",
+        encoding="utf-8",
+    )
+
+    dest = assemble_payload(snapshot, skills_src, tmp_path / "payload", "0.1.2")
+
+    lines = _pyvenv_cfg_path(dest).read_text(encoding="utf-8").splitlines()
+    home_lines = [ln for ln in lines if ln.split("=", 1)[0].strip() == "home"]
+    assert home_lines == ["home = " + INSTALL_ROOT + "\\versions\\0.1.2\\" + base_python_dir]
+    # 其它行原样保留——这道修复只改 home 这一行，不是重写整个文件。
+    assert "uv = 0.11.28" in lines
+
+
+def test_assemble_payload_tolerates_a_snapshot_with_no_pyvenv_cfg(
+    tmp_path: Path, snapshot, skills_src
+):
+    """测试快照里的 venv 只是几个假字节（见 snapshot fixture），没有真的 `pyvenv.cfg`
+    ——这不是这道修复要管的事（它只负责"文件存在但 home 指错了"这一种病），不该把装配
+    本身搞炸。"""
+    dest = assemble_payload(snapshot, skills_src, tmp_path / "payload", "0.1.2")
+    assert not _pyvenv_cfg_path(dest).exists()
+
+
+def test_assemble_payload_refuses_a_pyvenv_cfg_without_a_home_line(
+    tmp_path: Path, snapshot, skills_src
+):
+    """`pyvenv.cfg` 存在但没有 `home` 这一行，说明它根本不是一个正常的 venv 配置文件
+    ——装出来的 Python 解释器大概率起不来。响亮地炸掉，而不是悄悄放行一个改不了的坏文件。"""
+    cfg = _pyvenv_cfg_path(snapshot)
+    cfg.write_text("implementation = CPython\nversion_info = 3.11\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="pyvenv.cfg"):
+        assemble_payload(snapshot, skills_src, tmp_path / "payload", "0.1.2")
+
+
+def test_assemble_payload_accepts_a_pyvenv_cfg_whose_home_is_already_correct(
+    tmp_path: Path, snapshot, skills_src
+):
+    """同版本装配（从 0.1.2 自己的快照装 0.1.2）时，`home` 本来就已经指对了目标版本，重写
+    后内容一字不差。这不是"没有 home 行"（那才该炸），而是"已经对了"，必须照常放行——
+    别让"重写后没变化"被误判成畸形文件。"""
+    base_python_dir = BASE_PYTHON_REL.rsplit("\\", 1)[0]  # "python-base"
+    already_correct = "home = " + INSTALL_ROOT + "\\versions\\0.1.2\\" + base_python_dir
+    cfg = _pyvenv_cfg_path(snapshot)
+    cfg.write_text(already_correct + "\nimplementation = CPython\n", encoding="utf-8")
+
+    dest = assemble_payload(snapshot, skills_src, tmp_path / "payload", "0.1.2")
+
+    lines = _pyvenv_cfg_path(dest).read_text(encoding="utf-8").splitlines()
+    assert already_correct in lines
+    assert "implementation = CPython" in lines
