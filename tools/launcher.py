@@ -91,10 +91,14 @@ from builder.paths import (
     LAUNCH_LOCK_FILE,
     LAUNCHER_LOG,
     LOGS_DIR,
+    PIP_INDEX_URL_ENV,
     PLAYWRIGHT_DIR_REL,
     PLAYWRIGHT_ENV,
     PREVIOUS_FILE,
+    PYPI_MIRROR_URL,
     STARTUP_FAILURES_FILE,
+    UV_DEFAULT_INDEX_ENV,
+    UV_INDEX_URL_ENV,
     VERSIONS_DIR,
 )
 from tools.factory_state import (
@@ -199,6 +203,12 @@ def _child_env(install_root: Path, version: str) -> dict[str, str]:
     自己的 ms-playwright，不能还指着那个刚被拉黑的版本目录（下次更新它就被剪掉了）。
 
     AGENT_BROWSER_EXECUTABLE_ENV 同样按版本：见 _find_bundled_chromium。
+
+    PIP_INDEX_URL_ENV / UV_INDEX_URL_ENV / UV_DEFAULT_INDEX_ENV：agent 偶尔需要联网装一个
+    技能建议的小工具时，pip/uv 默认连的是 PyPI 官方地址（国外服务器）——跟 agent-browser
+    联网下载 Chrome 是同一类问题：不是被墙，是国际带宽绕远路，连不稳、常卡半天。指到国内
+    镜像（同步自官方、内容一样，服务器在国内），装包这件事才会真的稳定可用。三个变量名
+    覆盖 pip 与 uv 新旧两条解析路径，缘由见 builder/paths.py 里 PYPI_MIRROR_URL 的注释。
     """
     env = os.environ.copy()
     env[HERMES_HOME_ENV] = str(install_root / DATA_DIR_REL)
@@ -207,6 +217,9 @@ def _child_env(install_root: Path, version: str) -> dict[str, str]:
     chromium = _find_bundled_chromium(playwright_dir)
     if chromium is not None:
         env[AGENT_BROWSER_EXECUTABLE_ENV] = str(chromium)
+    env[PIP_INDEX_URL_ENV] = PYPI_MIRROR_URL
+    env[UV_INDEX_URL_ENV] = PYPI_MIRROR_URL
+    env[UV_DEFAULT_INDEX_ENV] = PYPI_MIRROR_URL
     return env
 
 

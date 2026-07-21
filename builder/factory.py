@@ -10,12 +10,35 @@ skills/。差一点点都不行——运行时那道闸门（tools/factory_state
 """
 
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 from builder.paths import FACTORY_DIR_REL, FACTORY_SKILLS, FACTORY_SOUL
 from tools.factory_state import assert_factory_complete
 
 FACTORY_SRC = Path(__file__).resolve().parent.parent / "factory"
+
+# 明确判定"用不了、也修不好"的出厂技能，逐个有名有姓、维护者亲口拍板排除——不是"控制器
+# 单方面砍技能"（那正是 2026-07-13 被维护者否决过的事）。每一条都必须能说清楚"为什么留着
+# 也没用"：
+#   - nano-pdf（PDF 编辑）：2026-07-21 拍板排除。装它需要联网装包，装上了还要另一把从没
+#     配置过的第三方 LLM key（它自己的 SKILL.md 原文："requires an API key"）——爸妈这边
+#     走这条路必炸。且 assemble_payload 已经把"PDF 处理"这件事用 pymupdf 铺了另一条能走
+#     通的路，留着 nano-pdf 只会制造"到底走哪条路"的混乱。
+EXCLUDED_SKILLS = ("productivity/nano-pdf",)
+
+
+def _ignore_excluded_skills(skills_src: Path) -> Callable[[str, list[str]], set[str]]:
+    """给 shutil.copytree 用的 ignore 回调：跳过 EXCLUDED_SKILLS 里点名的技能目录，
+    其余原样保留。只精确匹配点名的相对路径，不会误伤同目录下的其它技能。"""
+    excluded = {tuple(p.split("/")) for p in EXCLUDED_SKILLS}
+    root = skills_src.resolve()
+
+    def ignore(dir_path: str, names: list[str]) -> set[str]:
+        rel = Path(dir_path).resolve().relative_to(root).parts
+        return {name for name in names if rel + (name,) in excluded}
+
+    return ignore
 
 
 def _render_soul(src: Path) -> str:
@@ -56,7 +79,7 @@ def render_factory(dest: Path, skills_src: Path) -> Path:
     # 源里的 *.txt 是渲染前的原料（soul.txt），不进母版；config.yaml.tmpl 原样带走。
     shutil.copytree(FACTORY_SRC, factory, ignore=shutil.ignore_patterns("*.txt"))
     (factory / FACTORY_SOUL).write_text(_render_soul(FACTORY_SRC / "soul.txt"), encoding="utf-8")
-    shutil.copytree(skills_src, factory / FACTORY_SKILLS)
+    shutil.copytree(skills_src, factory / FACTORY_SKILLS, ignore=_ignore_excluded_skills(skills_src))
 
     # 打包器的产物必须能过运行时那道闸门——**同一个函数**，不是"看起来一样的一份检查"。
     # 顺带也挡住"打包时手滑把 .env / 某台机器的 sessions/ 或一份渲染好的 config.yaml

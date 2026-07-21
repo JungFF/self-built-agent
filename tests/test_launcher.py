@@ -41,9 +41,13 @@ from builder.paths import (
     HERMES_HOME_ENV,
     LAST_GOOD_FILE,
     LAUNCH_LOCK_FILE,
+    PIP_INDEX_URL_ENV,
     PLAYWRIGHT_DIR_REL,
     PLAYWRIGHT_ENV,
+    PYPI_MIRROR_URL,
     STARTUP_FAILURES_FILE,
+    UV_DEFAULT_INDEX_ENV,
+    UV_INDEX_URL_ENV,
     WORKSPACE_DIRNAME,
 )
 from tools import launcher
@@ -384,6 +388,52 @@ def test_agent_browser_env_is_left_unset_when_no_bundled_chromium_is_found(tmp_p
             proc.wait()
 
     assert seen.read_text(encoding="utf-8") == "<未设置>"
+
+
+def test_pip_and_uv_default_to_the_domestic_mirror(tmp_path: Path):
+    """agent 偶尔需要联网装一个技能建议的小工具时，pip/uv 默认连的是 PyPI 官方地址
+    （国外服务器）——跟 agent-browser 联网下载 Chrome 是同一类问题：不是被墙，是国际
+    带宽绕远路，连不稳、常卡半天。启动器必须把 pip 和 uv（新旧两个变量名都要，见
+    UV_DEFAULT_INDEX_ENV 的注释）都指到国内镜像（内容跟官方一样、服务器在国内），
+    装包这件事才会真的稳定可用，不管 agent 走 `pip install` 还是 `uv pip install`
+    这条路。"""
+    root = _root(tmp_path, "0.1.1", "0.1.0")
+
+    seen = tmp_path / "child-env.txt"
+    child = [
+        sys.executable,
+        "-c",
+        "import os,sys,time;"
+        "open(sys.argv[1],'w',encoding='utf-8').write("
+        f"os.environ.get({PIP_INDEX_URL_ENV!r},'<未设置>') + '|' + "
+        f"os.environ.get({UV_INDEX_URL_ENV!r},'<未设置>') + '|' + "
+        f"os.environ.get({UV_DEFAULT_INDEX_ENV!r},'<未设置>'));"
+        "time.sleep(60)",
+        str(seen),
+    ]
+
+    spawned = []
+
+    def spy(argv, env):
+        proc = launcher._spawn(argv, env)
+        spawned.append(proc)
+        return proc
+
+    try:
+        assert (
+            run(root, _ws(tmp_path), exe_argv=child, spawn=spy, health_seconds=1.5,
+                startup_seconds=0.2)
+            == 0
+        )
+    finally:
+        for proc in spawned:
+            proc.kill()
+            proc.wait()
+
+    assert (
+        seen.read_text(encoding="utf-8")
+        == f"{PYPI_MIRROR_URL}|{PYPI_MIRROR_URL}|{PYPI_MIRROR_URL}"
+    )
 
 
 # --------------------------------------------------------------------------

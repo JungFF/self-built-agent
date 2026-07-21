@@ -75,6 +75,28 @@ def test_render_factory_refuses_an_empty_skills_master(tmp_path: Path):
         render_factory(tmp_path / "out", empty)
 
 
+def test_render_factory_excludes_skills_that_cannot_work_for_the_end_user(
+    tmp_path: Path, skills_src: Path
+):
+    """维护者 2026-07-21 亲自拍板排除的技能：`nano-pdf`（PDF 编辑）——装它需要联网装包，
+    装上了还要另一把从没配置过的第三方 LLM key（见它自己的 SKILL.md："requires an API
+    key"），爸妈这边走这条路必炸；而且我们已经用 pymupdf 把"PDF 处理"这件事用另一条路
+    铺好了，不留着制造"到底走哪条路"的混乱。
+
+    这不是"控制器单方面砍技能"（那正是维护者之前否决过的事）——只排除这一个、有名有姓、
+    维护者亲口认定"没法修也没必要留"的技能，其余 71 个原样保留。"""
+    (skills_src / "productivity" / "nano-pdf").mkdir(parents=True)
+    (skills_src / "productivity" / "nano-pdf" / "SKILL.md").write_text(
+        "name: nano-pdf", encoding="utf-8"
+    )
+
+    factory = render_factory(tmp_path / "out", skills_src)
+
+    assert not (factory / paths.FACTORY_SKILLS / "productivity" / "nano-pdf").exists()
+    # 排除名单只精确匹配这一个技能——同目录下的其它技能、以及别的分类，必须原样保留。
+    assert (factory / paths.FACTORY_SKILLS / "creative" / "ascii-art" / "SKILL.md").exists()
+
+
 def test_soul_md_has_no_source_file_header_comment(tmp_path: Path, skills_src: Path):
     """soul.txt 的源文件头注释不能泄漏进 SOUL.md——那会直接进 agent 的 system prompt。"""
     factory = render_factory(tmp_path / "out", skills_src)

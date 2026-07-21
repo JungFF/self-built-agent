@@ -290,6 +290,21 @@ PLAYWRIGHT_ENV = "PLAYWRIGHT_BROWSERS_PATH"        # → <root>\versions\<cur>\m
 # 它就会直接复用，不再联网下载。
 AGENT_BROWSER_EXECUTABLE_ENV = "AGENT_BROWSER_EXECUTABLE_PATH"
 
+# agent 偶尔需要联网装一个技能建议的小工具（pip/uv 装的 Python 包）时，pip/uv 默认走的是
+# PyPI 官方地址（国外服务器）——跟 AGENT_BROWSER_EXECUTABLE_ENV 那条是同一类问题：爸妈在
+# 大陆，这个地址连不稳、经常卡半天，不是被墙、是国际带宽绕远路。清华大学镜像内容跟官方
+# 逐包同步、服务器在国内，连接快且稳定，国内开发者日常都在用。
+#
+# PIP_INDEX_URL 是 pip 自己认的变量（uv 的 pip 兼容子命令 `uv pip install` 也认它）；
+# UV_INDEX_URL / UV_DEFAULT_INDEX 是 uv 原生解析器（`uv add`/`uv sync` 那条路）认的
+# 变量——uv 把索引相关的命令行参数换过一版新的（`--default-index` 替代旧的
+# `--index-url`），旧变量目前还兼容、但保不齐哪天被摘掉，所以新旧都设。三个都设，
+# 不管 agent 走哪条装包的路，都会默认落到这个国内镜像上。
+PIP_INDEX_URL_ENV = "PIP_INDEX_URL"
+UV_INDEX_URL_ENV = "UV_INDEX_URL"
+UV_DEFAULT_INDEX_ENV = "UV_DEFAULT_INDEX"
+PYPI_MIRROR_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
 # ---- 工作台 ----
 WORKSPACE_DIRNAME = "小助手"            # 桌面上的工作台文件夹名
 
