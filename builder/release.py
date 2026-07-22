@@ -50,6 +50,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -165,6 +166,7 @@ def assemble_payload(snapshot_root: Path, skills_src: Path, dest: Path, version:
     agent_dir = dest / rel_path(AGENT_DIR_REL)
     _clean_git_worktree(agent_dir)
     _rewrite_venv_home(agent_dir, version)
+    _pin_clone_autocrlf(agent_dir)
     render_factory(dest, skills_src)  # 出厂母版（它自己会跑一遍消费方的闸门）
 
     tools_dst = dest / TOOLS_DIR_REL
@@ -180,6 +182,70 @@ def assemble_payload(snapshot_root: Path, skills_src: Path, dest: Path, version:
     for name in _SHIPPED_BUILDER:
         shutil.copy2(REPO_ROOT / BUILDER_DIR_REL / name, builder_dst / name)
     return dest
+
+
+# `git`、任意个 `-c 键=值`、然后 `clone`。捕获前半段是为了把新的 -c 插在 clone **之前**
+# ——git 只认 `git -c k=v <子命令>` 这个位置，插到 clone 后面会被当成 clone 的参数。
+_GIT_CLONE_RE = re.compile(r"(\bgit\b(?:\s+-c\s+\S+)*)(\s+clone\b)")
+
+
+def _pin_clone_autocrlf(agent_dir: Path) -> None:
+    """真机 2026-07-21 复现过的故障：桌面端首次启动时弹 "Hermes couldn't start"，
+    `bootstrap-*.log` 里是 `git checkout <钉死的 commit> failed (exit 1)`，
+    324 个文件"有本地修改"——**而那是一份刚刚克隆出来的仓库**。
+
+    机制：Hermes 的 bootstrap 不用我们打包进去的那份仓库，它从 GitHub **现克隆**一份到
+    `data\\hermes-agent`。Git for Windows 的 system 层默认 `core.autocrlf=true`，克隆时把
+    仓库里 LF 的文本文件全检出成 CRLF；而 install.ps1 是在**克隆之后**才
+    `git config core.autocrlf false`。于是工作区是 CRLF、blob 是 LF、又不再做转换，
+    git 逐字节比对 → 全员"已修改" → 紧接着的 checkout 直接 abort。
+
+    install.ps1 自己的注释把这套机制描述得一字不差（"Pin autocrlf=false on the managed
+    clone so git never renormalizes..."），只是那句 pin 落在了克隆之后——脏是在克隆那一刻
+    就已经造成的，事后再 pin 已经来不及。所以必须把 `-c core.autocrlf=false` 加到 clone
+    命令**自己身上**，跟它已经在传的 `-c windows.appendAtomically=false` 并排。
+
+    为什么这次可以动 Hermes 的源码：跟上面的 _clean_git_worktree、_rewrite_venv_home 是
+    同一类装配期外科修复。"只消费 Hermes 源码、不修改"说的是不 fork、不长期维护它的源码，
+    不是装配期一个字节都不能碰。代价由下面那条守卫兜住：上游一旦改写这段，装配立刻炸在
+    装配机上（那里有维护者盯着），而不是产出一个"看起来正常"、装到爸妈机器上才起不来的包。
+
+    全程走字节：read_text/write_text 默认做换行转换，会把"改两行"变成"整份 .ps1 的换行符
+    都被改写"——在一个正因为换行符而存在的修复里再种一次换行符问题，实在说不过去。
+    """
+    ps1_path = agent_dir / "scripts" / "install.ps1"
+    if not ps1_path.is_file():
+        return  # 快照里没有这个脚本（测试快照，或者 Hermes 将来换了 bootstrap 方式）
+
+    text = ps1_path.read_bytes().decode("utf-8")
+
+    def is_comment(line: str) -> bool:
+        return line.lstrip().startswith("#")
+
+    def pin(m: re.Match[str]) -> str:
+        # 已经钉过就原样返回：装配是幂等的，同一份快照装配两次不该把参数叠成两遍。
+        if "core.autocrlf" in m.group(1):
+            return m.group(0)
+        return f"{m.group(1)} -c core.autocrlf=false{m.group(2)}"
+
+    # 逐行处理并跳过注释行。注释里出现 `git clone` 是很正常的事（install.ps1 本身就有大段
+    # 解释这段逻辑的注释），而把注释算进来会让下面那条守卫出现**假阴性**：上游哪天真把
+    # clone 命令删了、只剩一行讲解它的注释，守卫就被那行注释骗过去、照常产出一个坏包——
+    # 安全网在最需要它的那一刻失效。顺带也避免把注释文本改得莫名其妙。
+    #
+    # split("\n") 而不是 splitlines()：CRLF 的 \r 会留在行尾，最后用 "\n" 拼回去，
+    # 原文的换行符原样保留（这个修复本身就是因为换行符而存在的，不能自己再改一遍）。
+    lines = text.split("\n")
+    if not any(_GIT_CLONE_RE.search(ln) for ln in lines if not is_comment(ln)):
+        raise ValueError(
+            f"{ps1_path} 里找不到任何 `git ... clone` 命令（注释不算）——上游大概率重写了这段"
+            " bootstrap。没法把 core.autocrlf=false 钉进克隆命令，而不钉的后果是每台全新机器"
+            "首次启动都卡在 `git checkout` abort、桌面端起不来。请重新核对 install.ps1 再装配。"
+            "未产出任何东西。"
+        )
+
+    pinned = [ln if is_comment(ln) else _GIT_CLONE_RE.sub(pin, ln) for ln in lines]
+    ps1_path.write_bytes("\n".join(pinned).encode("utf-8"))
 
 
 def _clean_git_worktree(agent_dir: Path) -> None:

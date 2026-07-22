@@ -878,6 +878,82 @@ def test_assemble_payload_tolerates_a_snapshot_with_no_pyvenv_cfg(
     assert not _pyvenv_cfg_path(dest).exists()
 
 
+def _install_ps1_path(root: Path) -> Path:
+    return root / rel_path(AGENT_DIR_REL) / "scripts" / "install.ps1"
+
+
+_CLONE_LINES = (
+    "Invoke-NativeWithRelaxedErrorAction { git -c windows.appendAtomically=false"
+    " clone --depth 1 --branch $Branch $RepoUrlSsh $InstallDir }\n"
+    "Invoke-NativeWithRelaxedErrorAction { git -c windows.appendAtomically=false"
+    " clone --depth 1 --branch $Branch $RepoUrlHttps $InstallDir }\n"
+)
+
+
+def test_assemble_payload_pins_autocrlf_on_the_hermes_clone(
+    tmp_path: Path, snapshot, skills_src
+):
+    """真机 2026-07-21 复现过的故障：桌面端首次启动，Hermes 自己的 bootstrap 从 GitHub
+    **现克隆**一份仓库到 `data\\hermes-agent`（打包进去的那份它根本不用），然后对这份新克隆
+    跑 `git checkout <钉死的 commit>`——直接 abort：324 个文件"有本地修改"。
+
+    刚克隆出来的仓库为什么是脏的：Git for Windows 的 system 层默认 `core.autocrlf=true`，
+    克隆时把仓库里 LF 的文本文件全检出成 CRLF；而 install.ps1 是在**克隆之后**才
+    `git config core.autocrlf false`。于是工作区是 CRLF、blob 是 LF、又不再做转换，
+    git 逐字节比对 → 全员"已修改"。install.ps1 自己的注释把这个机制写得一字不差，
+    只是那句 pin 落在了克隆之后——脏是在克隆那一刻就造成的。
+
+    所以必须在 clone 命令**自己身上**加 `-c core.autocrlf=false`（跟它已经在传的
+    `-c windows.appendAtomically=false` 并排）。真机验证过：删掉 data\\hermes-agent 逼出
+    全新克隆路径，带这个补丁克隆完工作区干净、checkout 成功、正确钉到目标 commit。
+
+    为什么可以改 Hermes 的源码：这跟 `_clean_git_worktree`、`_rewrite_venv_home` 是同一类
+    装配期外科修复——"只消费不修改"说的是不 fork、不长期维护它的源码，不是装配期一个字节
+    都不能碰。配一条守卫（见下一条测试）保证上游一改动构建立刻红。"""
+    ps1 = _install_ps1_path(snapshot)
+    ps1.parent.mkdir(parents=True, exist_ok=True)
+    ps1.write_text(_CLONE_LINES, encoding="utf-8")
+
+    dest = assemble_payload(snapshot, skills_src, tmp_path / "payload", "0.1.5")
+
+    text = _install_ps1_path(dest).read_text(encoding="utf-8")
+    assert text.count("-c core.autocrlf=false") == 2  # SSH 和 HTTPS 两条路都得钉
+    # 原来那个 -c 不能被顶掉：它治的是另一个病（杀软/OneDrive 导致的原子写失败）。
+    assert text.count("-c windows.appendAtomically=false") == 2
+
+
+def test_assemble_payload_refuses_an_install_ps1_whose_clone_it_cannot_find(
+    tmp_path: Path, snapshot, skills_src
+):
+    """install.ps1 在、但里面找不到可以钉的 `git ... clone`——说明上游把这段改了。
+
+    这时候**必须响亮地炸在装配机上**，而不是默默产出一个"看起来正常"的包：那个包装到
+    爸妈机器上的表现是桌面端起不来、弹 "Hermes couldn't start"，而维护者在一万公里外
+    完全不知道自己发了个坏版本。这正是本项目对静默失败的底线。
+
+    注释里那句话是故意留的：install.ps1 本身就有大段解释这段克隆逻辑的注释，如果守卫把
+    注释也算成"找到了 clone"，它就会在最需要它的那一刻（上游真把命令删了、只剩讲解它的
+    注释）被骗过去。"""
+    ps1 = _install_ps1_path(snapshot)
+    ps1.parent.mkdir(parents=True, exist_ok=True)
+    ps1.write_text(
+        "# 上游重写了这段：原来这里是 git clone --depth 1，现在改走别的路了\n"
+        "Write-Host 'hello'\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="install.ps1"):
+        assemble_payload(snapshot, skills_src, tmp_path / "payload", "0.1.5")
+
+
+def test_assemble_payload_tolerates_a_snapshot_with_no_install_ps1(
+    tmp_path: Path, snapshot, skills_src
+):
+    """测试快照里没有 `scripts/install.ps1`（见 snapshot fixture）——这道修复只负责
+    "文件在、但 clone 没钉 autocrlf"这一种病，不该把装配本身搞炸。"""
+    dest = assemble_payload(snapshot, skills_src, tmp_path / "payload", "0.1.5")
+    assert not _install_ps1_path(dest).exists()
+
+
 def test_assemble_payload_refuses_a_pyvenv_cfg_without_a_home_line(
     tmp_path: Path, snapshot, skills_src
 ):
