@@ -52,6 +52,7 @@
 
 import contextlib
 import os
+import stat
 from pathlib import Path
 
 from builder.paths import (
@@ -273,7 +274,25 @@ def atomic_write(path: Path, data: bytes) -> None:
     """
     tmp = tmp_path(path)
     tmp.write_bytes(data)
-    os.replace(tmp, path)
+    try:
+        os.replace(tmp, path)
+    except PermissionError:
+        # Windows 上 os.replace 到一个**只读**目标会 Access denied（[WinError 5]）；POSIX 换的是
+        # 目录项、看的是目录权限，同样一句照样成功。上面那段"POSIX 和 Windows 上都是原子替换"
+        # 说的是原子性，不是"两边都写得进去"——2026-07-21 整套测试第一次在 Windows 上跑才暴露。
+        #
+        # 为什么必须救而不是抛：把 data/ 里的文件锁成只读（而不是删掉）正是中国杀软套装的惯常
+        # 做法，而这个函数是 current.txt / previous.txt / .factory_version / config.yaml /
+        # SOUL.md 共用的唯一写入口。真落在 current.txt 上，这台机器就再也切不了版本——更新
+        # 通道恰恰是维护者唯一的远程救援手段，等于亲手拆掉它。
+        #
+        # 清只读位不是跟杀软抢地盘：这些是我们自己安装根里的状态文件，不是用户的文档。
+        # 目标不存在就说明 PermissionError 来自别处（tmp 被占用、目录只读），此时 chmod 会抛
+        # FileNotFoundError 把真正的原因盖掉——原样抛出去，让它响亮。
+        if not path.exists():
+            raise
+        os.chmod(path, stat.S_IWRITE)
+        os.replace(tmp, path)  # 清完还失败 = 真的写不进去，必须抛
 
 
 def factory_master(install_root: Path, version: str) -> Path:

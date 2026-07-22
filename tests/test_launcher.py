@@ -50,6 +50,7 @@ from builder.paths import (
     UV_INDEX_URL_ENV,
     WORKSPACE_DIRNAME,
 )
+from conftest import denied_read
 from tools import launcher
 from tools.launcher import run
 
@@ -1042,13 +1043,13 @@ def test_an_unreadable_previous_is_not_a_rollback_target(tmp_path: Path):
     当"有回滚目标"的凭据去拉黑 current。响亮地失败。"""
     root = _root(tmp_path, "0.1.1", "0.1.0")
     _first_failure(root, tmp_path)
-    (root / "previous.txt").chmod(0o000)
     spawn, calls = _fake_spawn(INSTANT_CRASH)
 
-    try:
+    # 必须用真能拒绝读取的机制：os.chmod(file, 0) 在 Windows 上只把文件标成只读，
+    # previous.txt 照样读得出来（见 tests/conftest.py）——那样这条用例根本没造出
+    # "读不出来"这个前提，走的是正常回滚路径，钉不住"绝不拿读不出的文件当回滚凭据"。
+    with denied_read(root / "previous.txt"):
         assert run(root, _ws(tmp_path), exe_argv=["fake"], spawn=spawn, **FAST) != 0
-    finally:
-        (root / "previous.txt").chmod(0o600)
 
     assert len(calls) == 1  # 没有回滚
     assert (root / "current.txt").read_text(encoding="utf-8") == "0.1.1"

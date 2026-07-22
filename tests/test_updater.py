@@ -33,6 +33,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from builder.paths import FACTORY_STAMP, WORKSPACE_DIRNAME
+from conftest import denied_read, denied_write
 from tools import updater
 from tools.updater import apply_update, parse_version, verify_manifest
 
@@ -538,6 +539,33 @@ def test_last_resort_guard_never_deletes_the_dir_current_txt_points_at(tmp_path:
     assert (root / "versions" / current).is_dir(), "current.txt 指向了一个已被删除的目录"
 
 
+def test_cleanup_tolerates_a_temp_file_that_is_still_held_open(tmp_path: Path):
+    """清理孤儿临时文件时撞上"文件正被占用"，绝不能把整次更新带崩。
+
+    Windows 不允许删除别的进程正打开着的文件（[WinError 32]），POSIX 可以——而 Windows
+    是这个产品唯一的交付平台。最真实的触发者不是并发实例（锁挡着呢），是**杀软正在扫描
+    那个刚下完的 900MB zip**：扫描期间文件被占用，而清理恰好在这一刻去删它。
+
+    这条结论项目里早就写下了，只是没落到位——_prune_old_versions 的 docstring 原话：
+    "清理失败（比如文件被占用）不影响本次更新已经成功这个事实，忽略即可，下次运行再试"。
+    那份宽容当时只落在 rmtree(ignore_errors=True) 上，_cleanup_stale_temp 里的 unlink
+    还是裸的（missing_ok=True 只挡 FileNotFoundError，挡不住"被占用"）。
+
+    2026-07-21 整套测试第一次在 Windows 上跑才撞出来。代价是不对称的：删不掉只是这一轮
+    少收回一点磁盘，下次开机再删；抛出去则是更新器整个崩掉——而更新器是维护者对这台
+    机器唯一的远程救援通道。
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    held = root / updater._DOWNLOAD_TMP_NAME
+    held.write_bytes(b"half-downloaded")
+
+    # 打开着不放：Windows 上这会让 unlink 抛 PermissionError（POSIX 上照样删得掉，
+    # 所以这条用例在 POSIX 上是"本来就该过"，在 Windows 上才真正咬人）。
+    with held.open("rb"):
+        updater._cleanup_stale_temp(root)  # 绝不能抛
+
+
 def test_last_resort_guard_never_rmtrees_the_version_current_txt_points_at(tmp_path: Path):
     """同一道"最后的保险"，这次真的把它执行到：另一个实例已经把这个版本装好、current.txt
     也切过去了。本实例接着走到"最终目录已存在"那个分支——它绝不能把那个目录当成"上次半途
@@ -867,11 +895,11 @@ def test_reconcile_survives_its_own_apply_hitting_an_unwritable_data_dir(tmp_pat
     (root / "current.txt").write_text("0.1.0", encoding="utf-8")
     data = root / "data"
     data.mkdir()
-    os.chmod(data, 0o500)  # 读+执行，无写：目录保护型杀软锁住 data/ 的典型表现
-    try:
+    # 目录保护型杀软锁住 data/ 的典型表现。锁的机制必须**真能拒绝写入**：os.chmod 对目录
+    # 在 Windows 上几乎无效（见 tests/conftest.py），用它等于这条用例在唯一的交付平台上
+    # 走的是正常路径、压根没造出故障。
+    with denied_write(data):
         assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) is None  # 已是最新，且没有崩
-    finally:
-        os.chmod(data, 0o700)  # 还原权限，让 tmp_path 的清理逻辑能删掉这棵树
 
     # 戳没落：没有在假装已经收敛，下一次开机会照样重试自愈。
     assert not (data / FACTORY_STAMP).exists()
@@ -918,12 +946,12 @@ def test_reconcile_survives_an_unreadable_factory_stamp(tmp_path: Path):
     data.mkdir(parents=True)
     stamp = data / FACTORY_STAMP
     stamp.write_text("0.1.0", encoding="utf-8")
-    os.chmod(stamp, 0)  # 杀软"锁住"而非删除：读的时候抛 PermissionError
 
-    try:
+    # 杀软"锁住"而非删除：读的时候抛 PermissionError。必须用真能拒绝读取的机制——
+    # os.chmod(file, 0) 在 Windows 上只是把文件标成只读，照样读得出来（见 tests/conftest.py），
+    # 那样这条用例测的就不是"戳读不出来"，而是别的东西。
+    with denied_read(stamp):
         assert apply_update(root, ch.as_uri(), pub, _ws(tmp_path)) == "0.1.1"
-    finally:
-        os.chmod(stamp, 0o600)  # 还原权限，让 tmp_path 的清理逻辑能删掉这棵树
 
     # 更新通道没被堵死：0.1.1 装上了，而且它的出厂状态落到了 data/（戳被重新写过）。
     assert (data / "SOUL.md").read_text(encoding="utf-8") == "我是小助手 0.1.1"

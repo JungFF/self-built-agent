@@ -55,6 +55,7 @@
 """
 import argparse
 import base64
+import contextlib
 import errno
 import hashlib
 import http.client
@@ -300,6 +301,18 @@ def _atomic_write(path: Path, text: str) -> None:
     atomic_write(path, text.encode("utf-8"))
 
 
+def _unlink_best_effort(path: Path) -> None:
+    """尽力删掉一个临时文件，删不掉就算了——语义等同于隔壁 rmtree 的 ignore_errors=True。
+
+    收 OSError 而不是只收 PermissionError：被占用（Windows 的 [WinError 32]）、只读、
+    路径太长、磁盘 IO 出错——对"清理孤儿"这件事来说是同一类结论，都是"这一轮先不收，
+    下次运行再来"。真正的兜底不在这里：磁盘被垃圾压住会被 _require_free_space 响亮地
+    拦下，那才是该喊的地方。
+    """
+    with contextlib.suppress(OSError):
+        path.unlink(missing_ok=True)
+
+
 def _cleanup_stale_temp(install_root: Path) -> None:
     """清掉上一次运行中途崩溃/断电留下的临时产物：没解压完的 staging 目录、
     没写完的下载 zip、没换名成功的 current.txt/previous.txt 临时文件。这些
@@ -310,9 +323,18 @@ def _cleanup_stale_temp(install_root: Path) -> None:
     staging 目录才一定是“死人的遗物”而不是“活人正在用的”。没有锁的话，这个函数
     会删掉另一个实例正在解压的 staging 目录，把它推向 FileNotFoundError，最后
     current.txt 指向一块虚空。锁文件本身（update.lock）不在清理范围内。"""
-    (install_root / _DOWNLOAD_TMP_NAME).unlink(missing_ok=True)
+    # 删不掉就算了，下次运行再收——和下面 rmtree(ignore_errors=True) 是同一份宽容，
+    # 理由也和 _prune_old_versions 的 docstring 一字不差："清理失败（比如文件被占用）
+    # 不影响本次更新已经成功这个事实"。
+    #
+    # 为什么 missing_ok=True 不够：它只挡 FileNotFoundError。Windows 不允许删除别的
+    # 进程正打开着的文件（[WinError 32] → PermissionError），POSIX 可以——而 Windows
+    # 是唯一的交付平台。最真实的触发者不是并发实例（锁挡着），是杀软正在扫描那个刚下完
+    # 的 900MB zip。抛出去的代价是更新器整个崩掉，而它是维护者对这台机器唯一的远程救援
+    # 通道；忍下来的代价只是这一轮少收回一点磁盘。两者完全不对称。
+    _unlink_best_effort(install_root / _DOWNLOAD_TMP_NAME)
     for name in (CURRENT_FILE, PREVIOUS_FILE):
-        tmp_path(install_root / name).unlink(missing_ok=True)
+        _unlink_best_effort(tmp_path(install_root / name))
     versions_dir = install_root / VERSIONS_DIR
     if versions_dir.is_dir():
         for prefix in _STALE_STAGING_PREFIXES:
@@ -476,7 +498,12 @@ def _stage_package(
             z.extractall(staging)
         return staging
     finally:
-        tmp_zip.unlink(missing_ok=True)
+        # finally 里**绝不能抛**：抛出去会把正在传播的那个真实异常整个盖掉（"包被篡改"
+        # 变成"文件被占用"，维护者从此查错方向），成功路径上则把一次已经完成的解压
+        # 变成失败。而 Windows 上删一个还被打开着的文件就会抛（[WinError 32]）——
+        # 杀软扫描这个刚下完的 900MB zip 是最常见的触发场景。删不掉不要紧：文件名固定，
+        # 下次下载原样盖掉，再不济也会被下一次运行开头的 _cleanup_stale_temp 收走。
+        _unlink_best_effort(tmp_zip)
 
 
 def _apply_update_locked(
