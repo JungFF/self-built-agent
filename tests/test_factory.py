@@ -97,6 +97,68 @@ def test_render_factory_excludes_skills_that_cannot_work_for_the_end_user(
     assert (factory / paths.FACTORY_SKILLS / "creative" / "ascii-art" / "SKILL.md").exists()
 
 
+def test_excluded_skills_are_dropped_from_the_bundled_manifest_too(
+    tmp_path: Path, skills_src: Path
+):
+    """排掉一个技能，必须连它在 `.bundled_manifest` 里的那一行一起排掉。
+
+    2026-07-21 真机实测（0.1.4 装机后量的）：`data/skills/` 下确实只剩 71 个 SKILL.md，
+    而 `.bundled_manifest` 仍是 72 行、`nano-pdf:ffc0c90fc7ed18952ccbf1b69ab3aabb` 好端端
+    躺在里面——ignore 回调只跳过技能**目录**，而清单是 skills 根目录下的一个普通文件，
+    被 copytree 原样拷走了。
+
+    后果不是"多一行没用的文本"：清单是"哪些技能属于出厂自带"的权威名录。名字还在名录里、
+    目录却不存在，等于对 agent 宣告"你有 PDF 编辑这个能力"——它真去调用的时候才发现没有。
+    那是一次没人在场的静默失败，而排除 nano-pdf 的全部理由恰恰就是"它在爸妈那边必炸"。
+    排掉技能却留着名字，等于把"必炸"换成了"必炸得更晚、更难查"。
+    """
+    (skills_src / "productivity" / "nano-pdf").mkdir(parents=True)
+    (skills_src / "productivity" / "nano-pdf" / "SKILL.md").write_text(
+        "name: nano-pdf", encoding="utf-8"
+    )
+    (skills_src / paths.FACTORY_SKILLS_MANIFEST).write_text(
+        "ascii-art:def456\nnano-pdf:ffc0c90f\n", encoding="utf-8"
+    )
+
+    factory = render_factory(tmp_path / "out", skills_src)
+
+    manifest = (factory / paths.FACTORY_SKILLS / paths.FACTORY_SKILLS_MANIFEST).read_text(
+        encoding="utf-8"
+    )
+    assert "nano-pdf" not in manifest
+    # 只删被排除的那一行，其余条目必须原样保留——清单少一行是"技能没了"，多删一行是
+    # "出厂技能被误判成习得技能"，两种都会让深度恢复算错该保留什么。
+    assert "ascii-art:def456" in manifest
+
+
+def test_stripping_the_manifest_does_not_rewrite_its_line_endings(
+    tmp_path: Path, skills_src: Path
+):
+    """删掉一行，就只删那一行——绝不能顺手把整份清单的换行符也改掉。
+
+    Path.read_text/write_text 默认都做换行转换：在 Windows 上读进来 \\r\\n 收成 \\n、
+    写出去 \\n 又放成 \\r\\n。于是"删一行"会变成"整份文件每一行都被改写"。
+
+    这不是洁癖。2026-07-21 花了大半天查的那个 bug——Hermes 仓库的 git 工作区一克隆出来
+    就有 324 个"已修改"文件、`git checkout <钉死 commit>` 直接 abort、桌面端起不来——
+    根因正是这种"看不见的整文件换行符改写"。清单虽然不进 git，但同一个坑不该在同一个
+    项目里种第二次：文件内容只应该按我们明确打算改的那样变。
+    """
+    (skills_src / "productivity" / "nano-pdf").mkdir(parents=True)
+    (skills_src / "productivity" / "nano-pdf" / "SKILL.md").write_text(
+        "name: nano-pdf", encoding="utf-8"
+    )
+    # 故意用 CRLF 落盘，且绕开 write_text 的换行转换，确保磁盘上就是这个字节序列。
+    (skills_src / paths.FACTORY_SKILLS_MANIFEST).write_bytes(
+        b"ascii-art:def456\r\nnano-pdf:ffc0c90f\r\napple-notes:abc123\r\n"
+    )
+
+    factory = render_factory(tmp_path / "out", skills_src)
+
+    raw = (factory / paths.FACTORY_SKILLS / paths.FACTORY_SKILLS_MANIFEST).read_bytes()
+    assert raw == b"ascii-art:def456\r\napple-notes:abc123\r\n"
+
+
 def test_soul_md_has_no_source_file_header_comment(tmp_path: Path, skills_src: Path):
     """soul.txt 的源文件头注释不能泄漏进 SOUL.md——那会直接进 agent 的 system prompt。"""
     factory = render_factory(tmp_path / "out", skills_src)

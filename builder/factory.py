@@ -13,7 +13,12 @@ import shutil
 from collections.abc import Callable
 from pathlib import Path
 
-from builder.paths import FACTORY_DIR_REL, FACTORY_SKILLS, FACTORY_SOUL
+from builder.paths import (
+    FACTORY_DIR_REL,
+    FACTORY_SKILLS,
+    FACTORY_SKILLS_MANIFEST,
+    FACTORY_SOUL,
+)
 from tools.factory_state import assert_factory_complete
 
 FACTORY_SRC = Path(__file__).resolve().parent.parent / "factory"
@@ -39,6 +44,43 @@ def _ignore_excluded_skills(skills_src: Path) -> Callable[[str, list[str]], set[
         return {name for name in names if rel + (name,) in excluded}
 
     return ignore
+
+
+def _strip_excluded_from_manifest(skills_dest: Path) -> None:
+    """把 EXCLUDED_SKILLS 点名的技能，从技能名录（.bundled_manifest）里一并删掉。
+
+    为什么单独有这一步：copytree 的 ignore 回调只管得住**目录**，而名录是技能根目录下的
+    一个普通文件，会被原样拷走。2026-07-21 真机实测（0.1.4 装完在机器上量的）：
+    data/skills/ 下确实只剩 71 个 SKILL.md，名录却仍是 72 行、nano-pdf 那条还在。
+
+    留着那条的后果不是"多一行没用的文本"：名录是"哪些技能属于出厂自带"的权威名录，
+    留着名字等于对 agent 宣告一个它并不具备的能力——它真去调用的时候才发现没有，
+    而排除这个技能的全部理由恰恰就是"它在爸妈那边必炸"。排掉目录却留下名字，
+    只是把"必炸"推迟成"更晚炸、更难查"。
+
+    名录不存在就什么都不做：它由 Hermes 快照提供，母版形状的硬要求由
+    assert_factory_complete 一处定义，不在这里再加一份会静默分叉的检查。
+    """
+    manifest = skills_dest / FACTORY_SKILLS_MANIFEST
+    if not manifest.is_file():
+        return
+    # 按技能名（basename）匹配，不是按 EXCLUDED_SKILLS 里那个带分类的相对路径：名录的
+    # 格式就是 `技能名:哈希`，压根不记分类。也就是说名录本身已经假定了技能名全局唯一
+    # ——真出现同名不同类的技能，先炸的是 Hermes 自己的名录，不是这里。
+    excluded = {p.split("/")[-1].encode("utf-8") for p in EXCLUDED_SKILLS}
+    # 全程走字节，不经过 read_text/write_text：那两个函数默认做换行转换（Windows 上读进来
+    # \r\n 收成 \n、写出去 \n 又放成 \r\n），于是"删掉一行"会顺手把**整份文件每一行**都
+    # 改写一遍。我们只打算删一行，文件的其余字节必须一个都不动。
+    #
+    # 这不是洁癖：2026-07-21 查了大半天的那个 bug——Hermes 仓库一克隆出来就有 324 个
+    # "已修改"文件、git checkout <钉死 commit> 直接 abort、桌面端起不来——根因正是这种
+    # 看不见的整文件换行符改写。同一个坑不该在同一个项目里种第二次。
+    kept = [
+        line
+        for line in manifest.read_bytes().splitlines(keepends=True)
+        if line.split(b":", 1)[0].strip() not in excluded
+    ]
+    manifest.write_bytes(b"".join(kept))
 
 
 def _render_soul(src: Path) -> str:
@@ -80,6 +122,8 @@ def render_factory(dest: Path, skills_src: Path) -> Path:
     shutil.copytree(FACTORY_SRC, factory, ignore=shutil.ignore_patterns("*.txt"))
     (factory / FACTORY_SOUL).write_text(_render_soul(FACTORY_SRC / "soul.txt"), encoding="utf-8")
     shutil.copytree(skills_src, factory / FACTORY_SKILLS, ignore=_ignore_excluded_skills(skills_src))
+    # 目录排掉了，名录里那一行也得排掉——否则名录会宣告一个磁盘上并不存在的技能。
+    _strip_excluded_from_manifest(factory / FACTORY_SKILLS)
 
     # 打包器的产物必须能过运行时那道闸门——**同一个函数**，不是"看起来一样的一份检查"。
     # 顺带也挡住"打包时手滑把 .env / 某台机器的 sessions/ 或一份渲染好的 config.yaml

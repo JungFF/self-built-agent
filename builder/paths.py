@@ -256,6 +256,10 @@ BUILDER_DIR_REL = "builder"
 FACTORY_CONFIG_TMPL = "config.yaml.tmpl"
 FACTORY_SOUL = "SOUL.md"
 FACTORY_SKILLS = "skills"
+# 技能根目录下那份"哪些技能属于出厂自带"的名录（`技能名:哈希` 一行一条），随 Hermes
+# 快照一起来。名字与磁盘必须一致：2026-07-21 真机实测，排除 nano-pdf 只删了目录、
+# 名录还留着那一行，等于对 agent 宣告一个它并不具备的能力——调用时才炸，且没人在场。
+FACTORY_SKILLS_MANIFEST = ".bundled_manifest"
 
 # ---- HERMES_HOME（= data/）内的文件（相对 DATA_DIR_REL）----
 ENV_FILE = ".env"                      # 激活码：DASHSCOPE_API_KEY。用户独有，永不下发
