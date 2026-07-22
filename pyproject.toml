@@ -19,3 +19,9 @@ dev = [
 # are unimportable from tests. `pythonpath = ["."]` makes `uv run pytest`
 # behave the same as `uv run python -m pytest` for in-repo imports.
 pythonpath = ["."]
+# 只收集本仓库自己的测试。装配产物（installer/payload/）里整棵 hermes-agent 都在——
+# 连同它自己几千条测试。不限定的话 `uv run pytest` 会把它们一起收进来：2026-07-21 装配
+# 0.1.5 之后实测 644 个收集错误、跑了 171 秒，而本仓库一条测试都还没开始跑。
+# 更糟的是它会**掩盖真实结果**：满屏第三方测试的红字里，自己的测试是绿是红根本看不出来，
+# 而"全量测试必须通过"正是这个项目每次提交的前置闸门。
+testpaths = ["tests"]

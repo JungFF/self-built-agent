@@ -13,6 +13,11 @@ dist/
 build/
 *.zip
 third_party/
+# 装配产物：installer/payload/ 是 assemble_payload 铺出来的一整棵版本目录（约 2.7GB，
+# 含整个 hermes-agent 快照），installer/Output/ 是 ISCC 编译出的安装器（约 0.9GB）。
+# 都是每轮重新生成的中间物，不该进 git。
+installer/payload/
+installer/Output/
 
 # Python
 .venv/

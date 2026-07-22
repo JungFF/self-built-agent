@@ -945,6 +945,48 @@ def test_assemble_payload_refuses_an_install_ps1_whose_clone_it_cannot_find(
         assemble_payload(snapshot, skills_src, tmp_path / "payload", "0.1.5")
 
 
+def test_assemble_payload_does_not_pin_a_git_clone_inside_a_string_literal(
+    tmp_path: Path, snapshot, skills_src
+):
+    """真实的 install.ps1 里有这么一行（0.1.5 装配时撞到的）：
+
+        throw "Failed to download repository (tried git clone SSH, HTTPS, and ZIP)"
+
+    那是**错误信息的文本**，不是要执行的命令。把 -c 插进去只会让维护者看到一条莫名其妙的
+    报错；更要命的是守卫会因此产生假阴性——上游哪天真把三条 clone 命令都换掉、只剩这行
+    错误信息，守卫就被这段字符串骗过去、照常产出一个坏包。
+
+    跟跳过注释是同一个道理：只认真正处在命令位置上的 `git ... clone`。"""
+    ps1 = _install_ps1_path(snapshot)
+    ps1.parent.mkdir(parents=True, exist_ok=True)
+    ps1.write_text(
+        _CLONE_LINES
+        + '        throw "Failed to download repository (tried git clone SSH, HTTPS, and ZIP)"\n',
+        encoding="utf-8",
+    )
+
+    dest = assemble_payload(snapshot, skills_src, tmp_path / "payload", "0.1.5")
+
+    text = _install_ps1_path(dest).read_text(encoding="utf-8")
+    assert text.count("-c core.autocrlf=false") == 2  # 两条真命令，不含那行字符串
+    assert 'tried git clone SSH, HTTPS, and ZIP' in text  # 错误信息一个字都没被动过
+
+
+def test_assemble_payload_refuses_when_the_only_git_clone_is_inside_a_string(
+    tmp_path: Path, snapshot, skills_src
+):
+    """只剩一行提到 git clone 的**错误信息**、真正的克隆命令没了——守卫必须照炸不误。
+    这是上一条测试那个假阴性真正会咬人的形态。"""
+    ps1 = _install_ps1_path(snapshot)
+    ps1.parent.mkdir(parents=True, exist_ok=True)
+    ps1.write_text(
+        '        throw "Failed to download repository (tried git clone SSH, HTTPS, and ZIP)"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="install.ps1"):
+        assemble_payload(snapshot, skills_src, tmp_path / "payload", "0.1.5")
+
+
 def test_assemble_payload_tolerates_a_snapshot_with_no_install_ps1(
     tmp_path: Path, snapshot, skills_src
 ):

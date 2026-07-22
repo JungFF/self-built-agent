@@ -219,32 +219,50 @@ def _pin_clone_autocrlf(agent_dir: Path) -> None:
 
     text = ps1_path.read_bytes().decode("utf-8")
 
-    def is_comment(line: str) -> bool:
-        return line.lstrip().startswith("#")
-
     def pin(m: re.Match[str]) -> str:
         # 已经钉过就原样返回：装配是幂等的，同一份快照装配两次不该把参数叠成两遍。
         if "core.autocrlf" in m.group(1):
             return m.group(0)
         return f"{m.group(1)} -c core.autocrlf=false{m.group(2)}"
 
-    # 逐行处理并跳过注释行。注释里出现 `git clone` 是很正常的事（install.ps1 本身就有大段
-    # 解释这段逻辑的注释），而把注释算进来会让下面那条守卫出现**假阴性**：上游哪天真把
-    # clone 命令删了、只剩一行讲解它的注释，守卫就被那行注释骗过去、照常产出一个坏包——
-    # 安全网在最需要它的那一刻失效。顺带也避免把注释文本改得莫名其妙。
-    #
+    def commands_in(line: str) -> list[re.Match[str]]:
+        """这一行里真正处在**命令位置**上的 `git ... clone`。
+
+        要排掉两种"看起来像命令、其实是文本"的东西，它们都在真实的 install.ps1 里出现过：
+
+        - 注释：`# Pin autocrlf=false on the managed clone so git never renormalizes...`
+        - 字符串字面量：`throw "Failed to download repository (tried git clone SSH, ...)"`
+
+        算进来有两重代价。轻的是把注释和错误信息改得莫名其妙；重的是让下面那条守卫出现
+        **假阴性**——上游哪天真把三条 clone 命令都换掉、只剩一行讲解它的注释或一句提到它的
+        报错，守卫就被那段文本骗过去、照常产出一个装到爸妈机器上才起不来的包。安全网恰恰
+        在最需要它的那一刻失效。
+
+        判断"在不在字符串里"用的是朴素规则：数一数匹配位置之前有几个双引号，奇数就是在
+        字符串内。PowerShell 的转义（``""``、反引号）会让它偶尔判错，但那只会让我们**少改
+        一处**（保守方向），不会把一处文本误当成命令——而守卫要防的正是后者。
+        """
+        if line.lstrip().startswith("#"):
+            return []
+        return [m for m in _GIT_CLONE_RE.finditer(line) if line.count('"', 0, m.start()) % 2 == 0]
+
     # split("\n") 而不是 splitlines()：CRLF 的 \r 会留在行尾，最后用 "\n" 拼回去，
     # 原文的换行符原样保留（这个修复本身就是因为换行符而存在的，不能自己再改一遍）。
     lines = text.split("\n")
-    if not any(_GIT_CLONE_RE.search(ln) for ln in lines if not is_comment(ln)):
+    if not any(commands_in(ln) for ln in lines):
         raise ValueError(
-            f"{ps1_path} 里找不到任何 `git ... clone` 命令（注释不算）——上游大概率重写了这段"
-            " bootstrap。没法把 core.autocrlf=false 钉进克隆命令，而不钉的后果是每台全新机器"
-            "首次启动都卡在 `git checkout` abort、桌面端起不来。请重新核对 install.ps1 再装配。"
-            "未产出任何东西。"
+            f"{ps1_path} 里找不到任何 `git ... clone` 命令（注释和字符串里的不算）——上游大概率"
+            "重写了这段 bootstrap。没法把 core.autocrlf=false 钉进克隆命令，而不钉的后果是每台"
+            "全新机器首次启动都卡在 `git checkout` abort、桌面端起不来。请重新核对 install.ps1 "
+            "再装配。未产出任何东西。"
         )
 
-    pinned = [ln if is_comment(ln) else _GIT_CLONE_RE.sub(pin, ln) for ln in lines]
+    pinned = []
+    for line in lines:
+        # 从后往前替换：先动后面的匹配，前面那些匹配的下标才不会被插入的文本顶偏。
+        for m in reversed(commands_in(line)):
+            line = line[: m.start()] + pin(m) + line[m.end() :]
+        pinned.append(line)
     ps1_path.write_bytes("\n".join(pinned).encode("utf-8"))
 
 
